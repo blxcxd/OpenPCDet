@@ -63,7 +63,20 @@ class KittiDataset(DatasetTemplate):
     def get_lidar(self, idx):
         lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
         assert lidar_file.exists()
-        return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+        return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 7)
+        
+        #number_of_channels = 7  # ['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time']
+        #points = np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, number_of_channels)
+        # replace the list values with statistical values; for x, y, z and time, use 0 and 1 as means and std to avoid normalization
+        #means = [0, 0, 0, -13.0, -3.0, -0.1, 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        #stds =  [1, 1, 1, 14.0, 8.0, 6.0, 1]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        #in practice, you should use either train, or train+val values to calculate mean and stds. Note that x, y, z, and time are not normed, but you can experiment with that.
+        #means = [0, 0, 0, mean_RCS (~ -13.0), mean_v_r (~-3.0), mean_vr_comp (~ -0.1), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        #stds =  [1, 1, 1, std_RCS (~14.0),  std_v_r (~8.0),    std_v_r_comp (~6.0), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+
+        #we then norm the channels
+        #points = (points - means)/stds
+        #return points
 
     def get_image(self, idx):
         """
@@ -74,6 +87,8 @@ class KittiDataset(DatasetTemplate):
             image: (H, W, 3), RGB Image
         """
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        if not img_file.exists():
+            img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
         assert img_file.exists()
         image = io.imread(img_file)
         image = image.astype(np.float32)
@@ -82,6 +97,8 @@ class KittiDataset(DatasetTemplate):
 
     def get_image_shape(self, idx):
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        if not img_file.exists():
+            img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
         assert img_file.exists()
         return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
 
@@ -153,7 +170,7 @@ class KittiDataset(DatasetTemplate):
         def process_single_scene(sample_idx):
             print('%s sample_idx: %s' % (self.split, sample_idx))
             info = {}
-            pc_info = {'num_features': 4, 'lidar_idx': sample_idx}
+            pc_info = {'num_features': 7, 'lidar_idx': sample_idx}
             info['point_cloud'] = pc_info
 
             image_info = {'image_idx': sample_idx, 'image_shape': self.get_image_shape(sample_idx)}
@@ -479,6 +496,8 @@ if __name__ == '__main__':
         create_kitti_infos(
             dataset_cfg=dataset_cfg,
             class_names=['Car', 'Pedestrian', 'Cyclist'],
-            data_path=ROOT_DIR / 'data' / 'kitti',
-            save_path=ROOT_DIR / 'data' / 'kitti'
+            # data_path=ROOT_DIR / 'data' / 'kitti',
+            # save_path=ROOT_DIR / 'data' / 'kitti'
+            data_path=ROOT_DIR / 'data' / 'view_of_delft' / 'radar_5frames',
+            save_path=ROOT_DIR / 'data' / 'view_of_delft' / 'radar_5frames'
         )
