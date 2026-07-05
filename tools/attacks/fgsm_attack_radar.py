@@ -1,7 +1,8 @@
-import _init_path
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import datetime
-import os
 from pathlib import Path
 
 import numpy as np
@@ -54,17 +55,21 @@ def apply_perturbation_mask(points, perturbation, attack_feature):
     mask = torch.ones_like(points)
     
     if attack_feature == 'xyz':
-        mask[:, 3:] = 0.0
+        mask[..., 3:] = 0.0
     elif attack_feature == 'doppler':
-        mask[:, :3] = 0.0
-        mask[:, 4:] = 0.0
+        mask[..., :4] = 0.0
+        mask[..., 5:] = 0.0
     elif attack_feature == 'intensity':
-        mask[:, :4] = 0.0
+        mask[..., :3] = 0.0
+        mask[..., 4:] = 0.0
     
     return perturbation * mask
 
 
 def fgsm_attack_voxel(model, batch_dict, epsilon, attack_feature='all'):
+    original_mode = model.training
+    original_keys = set(batch_dict.keys())
+    
     model.train()
     
     voxels = batch_dict['voxels'].clone().detach().requires_grad_(True)
@@ -93,19 +98,31 @@ def fgsm_attack_voxel(model, batch_dict, epsilon, attack_feature='all'):
     for i in range(min(perturbed_voxels.shape[-1], 5)):
         perturbed_voxels[..., i] = torch.clamp(perturbed_voxels[..., i], min_vals[i], max_vals[i])
     
+    keys_to_remove = set(batch_dict.keys()) - original_keys
+    for key in keys_to_remove:
+        del batch_dict[key]
+    
+    model.train(original_mode)
     return perturbed_voxels.detach()
 
 
 def pgd_attack_voxel(model, batch_dict, epsilon, attack_feature='all', steps=5):
+    original_mode = model.training
+    original_keys = set(batch_dict.keys())
+    
     model.train()
     
     original_voxels = batch_dict['voxels'].clone().detach()
     perturbed_voxels = original_voxels.clone().requires_grad_(True)
     
-    alpha = epsilon / steps
+    alpha = 2 * epsilon / steps
     
     for _ in range(steps):
         batch_dict['voxels'] = perturbed_voxels
+        
+        keys_to_remove = set(batch_dict.keys()) - original_keys
+        for key in keys_to_remove:
+            del batch_dict[key]
         
         model.zero_grad()
         
@@ -121,6 +138,8 @@ def pgd_attack_voxel(model, batch_dict, epsilon, attack_feature='all', steps=5):
         
         perturbed_voxels = perturbed_voxels + perturbation
         
+        perturbed_voxels = torch.max(torch.min(perturbed_voxels, original_voxels + epsilon), original_voxels - epsilon)
+        
         point_cloud_range = np.array(cfg.DATA_CONFIG.POINT_CLOUD_RANGE)
         min_vals = torch.tensor([point_cloud_range[0], point_cloud_range[1], point_cloud_range[2], -10.0, 0.0], 
                                 device=perturbed_voxels.device)
@@ -130,11 +149,13 @@ def pgd_attack_voxel(model, batch_dict, epsilon, attack_feature='all', steps=5):
         for i in range(min(perturbed_voxels.shape[-1], 5)):
             perturbed_voxels[..., i] = torch.clamp(perturbed_voxels[..., i], min_vals[i], max_vals[i])
         
-        perturbation = torch.clamp(perturbed_voxels - original_voxels, -epsilon, epsilon)
-        perturbed_voxels = original_voxels + perturbation
-        
         perturbed_voxels = perturbed_voxels.detach().requires_grad_(True)
     
+    keys_to_remove = set(batch_dict.keys()) - original_keys
+    for key in keys_to_remove:
+        del batch_dict[key]
+    
+    model.train(original_mode)
     return perturbed_voxels.detach()
 
 
@@ -143,6 +164,7 @@ def evaluate_attack(model, dataloader, args, logger):
     
     total_samples = 0
     attack_success = 0
+    orig_detected_count = 0
     original_recall = 0
     attacked_recall = 0
     gt_count = 0
@@ -186,8 +208,10 @@ def evaluate_attack(model, dataloader, args, logger):
         orig_detected = len(original_boxes) > 0 and original_scores.max() >= 0.5
         attack_success_cond = len(attacked_boxes) == 0 or attacked_scores.max() < 0.5
         
-        if orig_detected and attack_success_cond:
-            attack_success += 1
+        if orig_detected:
+            orig_detected_count += 1
+            if attack_success_cond:
+                attack_success += 1
         
         total_samples += 1
         progress_bar.update()
@@ -196,7 +220,9 @@ def evaluate_attack(model, dataloader, args, logger):
     
     original_recall_rate = original_recall / max(gt_count, 1)
     attacked_recall_rate = attacked_recall / max(gt_count, 1)
-    attack_success_rate = attack_success / max(total_samples, 1)
+    
+    attack_success_rate_sample = attack_success / max(orig_detected_count, 1)
+    attack_success_rate_target = (original_recall - attacked_recall) / max(original_recall, 1) if original_recall > 0 else 0.0
     
     logger.info('=' * 70)
     logger.info('Attack Results for 4D Radar Data:')
@@ -208,19 +234,23 @@ def evaluate_attack(model, dataloader, args, logger):
     logger.info(f'Total Samples: {total_samples}')
     logger.info(f'Original Recall@0.5: {original_recall_rate:.4f}')
     logger.info(f'Attacked Recall@0.5: {attacked_recall_rate:.4f}')
-    logger.info(f'Attack Success Rate: {attack_success_rate:.4f}')
+    logger.info(f'Attack Success Rate (Sample): {attack_success_rate_sample:.4f}')
+    logger.info(f'Attack Success Rate (Target): {attack_success_rate_target:.4f}')
     logger.info(f'Recall Drop: {(original_recall_rate - attacked_recall_rate):.4f}')
     logger.info('=' * 70)
     
     return {
+        'total_samples': total_samples,
         'original_recall': original_recall_rate,
         'attacked_recall': attacked_recall_rate,
-        'attack_success_rate': attack_success_rate,
+        'attack_success_rate_sample': attack_success_rate_sample,
+        'attack_success_rate_target': attack_success_rate_target,
         'recall_drop': original_recall_rate - attacked_recall_rate
     }
 
 
 def main():
+    os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     args, cfg = parse_config()
 
     if args.launcher == 'none':
@@ -271,10 +301,11 @@ def main():
         f.write(f'Attack Feature: {args.attack_feature}\n')
         if args.attack_type == 'pgd':
             f.write(f'PGD Steps: {args.pgd_steps}\n')
-        f.write(f'Total Samples: {results["total_samples"] if "total_samples" in results else total_samples}\n')
+        f.write(f'Total Samples: {results["total_samples"]}\n')
         f.write(f'Original Recall@0.5: {results["original_recall"]:.4f}\n')
         f.write(f'Attacked Recall@0.5: {results["attacked_recall"]:.4f}\n')
-        f.write(f'Attack Success Rate: {results["attack_success_rate"]:.4f}\n')
+        f.write(f'Attack Success Rate (Sample): {results["attack_success_rate_sample"]:.4f}\n')
+        f.write(f'Attack Success Rate (Target): {results["attack_success_rate_target"]:.4f}\n')
         f.write(f'Recall Drop: {results["recall_drop"]:.4f}\n')
 
     logger.info('Attack evaluation finished. Results saved to %s' % output_dir)

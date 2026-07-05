@@ -1,7 +1,8 @@
-import _init_path
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import datetime
-import os
 from pathlib import Path
 
 import numpy as np
@@ -170,6 +171,7 @@ def evaluate_attack(model, dataloader, args, logger):
 
 
 def main():
+    os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     args, cfg = parse_config()
 
     if args.launcher == 'none':
