@@ -15,11 +15,15 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils import common_utils
 
-from attacks.radar_point_attack import (
+from radar_attack.adapters.openpcdet import (
     PointCloudVoxelizer,
     get_feature_names,
     get_voxel_settings,
-    point_cloud_attack,
+)
+from radar_attack.attacks.gradient import point_cloud_attack
+from radar_attack.evaluation import (
+    AdversarialPointCloudWriter,
+    DetectionAttackMetrics,
 )
 
 
@@ -57,6 +61,12 @@ def parse_config():
                         help='point topology: fixed pillars or per-step revoxelization')
     parser.add_argument('--num_samples', type=int, default=None, help='number of samples to attack')
     parser.add_argument('--save_adv', action='store_true', default=False, help='save adversarial samples')
+    parser.add_argument('--adv_dir', type=str, default=None,
+                        help='directory for adversarial raw points (default: experiment output/adversarial_points)')
+    parser.add_argument('--adv_format', choices=['npy', 'bin'], default='npy',
+                        help='saved adversarial point-cloud format')
+    parser.add_argument('--score_threshold', type=float, default=0.5,
+                        help='confidence threshold used by sample-level attack success rate')
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--local_rank', type=int, default=None, help='local rank for distributed training')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
@@ -68,6 +78,14 @@ def parse_config():
         parser.error('--epsilon must be non-negative')
     if args.pgd_steps <= 0:
         parser.error('--pgd_steps must be positive')
+    if args.step_size is not None and args.step_size <= 0:
+        parser.error('--step_size must be positive')
+    if args.num_samples is not None and args.num_samples <= 0:
+        parser.error('--num_samples must be positive')
+    if not 0 <= args.score_threshold <= 1:
+        parser.error('--score_threshold must be in [0, 1]')
+    if args.save_adv and args.attack_domain != 'point':
+        parser.error('--save_adv requires --attack_domain point')
     for name in ['epsilon_xyz', 'epsilon_rcs', 'epsilon_doppler', 'epsilon_time']:
         value = getattr(args, name)
         if value is not None and value < 0:
@@ -198,18 +216,10 @@ def pgd_attack_voxel(model, batch_dict, epsilon, attack_feature='all', steps=5):
     return perturbed_voxels.detach()
 
 
-def evaluate_attack(model, dataloader, args, logger):
+def evaluate_attack(model, dataloader, args, logger, output_dir):
     model.eval()
-    
-    total_samples = 0
-    attack_success = 0
-    orig_detected_count = 0
-    original_recall = 0
-    attacked_recall = 0
-    gt_count = 0
-    max_abs_perturbation = 0.0
-    mean_abs_perturbation = 0.0
-    perturbation_batches = 0
+    metrics = DetectionAttackMetrics(score_threshold=args.score_threshold)
+    writer = None
 
     if args.attack_domain == 'point':
         voxel_size, max_points, max_voxels = get_voxel_settings(cfg.DATA_CONFIG)
@@ -220,16 +230,50 @@ def evaluate_attack(model, dataloader, args, logger):
             'doppler': args.epsilon_doppler,
             'time': args.epsilon_time,
         }
+        if args.save_adv:
+            adversarial_dir = (
+                Path(args.adv_dir)
+                if args.adv_dir is not None
+                else output_dir / 'adversarial_points'
+            )
+            writer = AdversarialPointCloudWriter(
+                output_dir=adversarial_dir,
+                feature_names=feature_names,
+                file_format=args.adv_format,
+                run_metadata={
+                    'attack_domain': args.attack_domain,
+                    'attack_type': args.attack_type,
+                    'attack_feature': args.attack_feature,
+                    'epsilon': args.epsilon,
+                    'epsilon_xyz': args.epsilon_xyz,
+                    'epsilon_rcs': args.epsilon_rcs,
+                    'epsilon_doppler': args.epsilon_doppler,
+                    'epsilon_time': args.epsilon_time,
+                    'pgd_steps': args.pgd_steps,
+                    'step_size': args.step_size,
+                    'random_start': args.random_start,
+                    'voxel_mode': args.voxel_mode,
+                },
+            )
+            logger.info('Adversarial raw points will be saved to %s', adversarial_dir)
     
     if args.num_samples is not None:
-        total_iters = min(args.num_samples, len(dataloader))
+        total_samples_expected = min(args.num_samples, len(dataloader.dataset))
     else:
-        total_iters = len(dataloader)
+        total_samples_expected = len(dataloader.dataset)
     
-    progress_bar = tqdm.tqdm(total=total_iters, leave=True, desc='Attack Evaluation', dynamic_ncols=True)
+    progress_bar = tqdm.tqdm(
+        total=total_samples_expected,
+        leave=True,
+        desc='Attack Evaluation',
+        dynamic_ncols=True,
+    )
     
-    for i, batch_dict in enumerate(dataloader):
-        if args.num_samples is not None and i >= args.num_samples:
+    for batch_dict in dataloader:
+        if (
+            args.num_samples is not None
+            and metrics.total_samples >= args.num_samples
+        ):
             break
             
         load_data_to_gpu(batch_dict)
@@ -238,6 +282,7 @@ def evaluate_attack(model, dataloader, args, logger):
             pred_dicts_original, ret_dict_original = model(dict(batch_dict))
 
         if args.attack_domain == 'point':
+            original_points = batch_dict['points'].detach().clone()
             voxelizer = PointCloudVoxelizer(
                 cfg.DATA_CONFIG.POINT_CLOUD_RANGE,
                 voxel_size,
@@ -245,7 +290,7 @@ def evaluate_attack(model, dataloader, args, logger):
                 max_voxels,
                 int(batch_dict['batch_size']),
             )
-            perturbed_points, voxel_data, perturbation_stats = point_cloud_attack(
+            attack_output = point_cloud_attack(
                 model=model,
                 batch_dict=batch_dict,
                 voxelizer=voxelizer,
@@ -259,14 +304,15 @@ def evaluate_attack(model, dataloader, args, logger):
                 random_start=args.random_start,
                 voxel_mode=args.voxel_mode,
             )
-            batch_dict['points'] = perturbed_points
-            batch_dict.update(voxel_data)
-            max_abs_perturbation = max(
-                max_abs_perturbation,
-                perturbation_stats['max_abs_perturbation'],
-            )
-            mean_abs_perturbation += perturbation_stats['mean_abs_perturbation']
-            perturbation_batches += 1
+            batch_dict['points'] = attack_output.adv_points
+            batch_dict.update(attack_output.model_inputs)
+            metrics.update_perturbation(attack_output.stats)
+            if writer is not None:
+                writer.save_batch(
+                    original_points,
+                    attack_output.adv_points,
+                    batch_dict,
+                )
         elif args.attack_type == 'fgsm':
             perturbed_voxels = fgsm_attack_voxel(
                 model, batch_dict, args.epsilon, args.attack_feature
@@ -281,35 +327,17 @@ def evaluate_attack(model, dataloader, args, logger):
         
         with torch.no_grad():
             pred_dicts_attacked, ret_dict_attacked = model(dict(batch_dict))
-        
-        original_recall += ret_dict_original.get('rcnn_0.5', 0)
-        attacked_recall += ret_dict_attacked.get('rcnn_0.5', 0)
-        gt_count += ret_dict_original.get('gt', 0)
-        
-        original_boxes = pred_dicts_original[0]['pred_boxes']
-        attacked_boxes = pred_dicts_attacked[0]['pred_boxes']
-        
-        original_scores = pred_dicts_original[0]['pred_scores'] if len(pred_dicts_original[0]['pred_scores']) > 0 else torch.tensor([0.0])
-        attacked_scores = pred_dicts_attacked[0]['pred_scores'] if len(pred_dicts_attacked[0]['pred_scores']) > 0 else torch.tensor([0.0])
-        
-        orig_detected = len(original_boxes) > 0 and original_scores.max() >= 0.5
-        attack_success_cond = len(attacked_boxes) == 0 or attacked_scores.max() < 0.5
-        
-        if orig_detected:
-            orig_detected_count += 1
-            if attack_success_cond:
-                attack_success += 1
-        
-        total_samples += 1
-        progress_bar.update()
+
+        metrics.update_predictions(
+            pred_dicts_original,
+            pred_dicts_attacked,
+            ret_dict_original,
+            ret_dict_attacked,
+        )
+        progress_bar.update(len(pred_dicts_original))
     
     progress_bar.close()
-    
-    original_recall_rate = original_recall / max(gt_count, 1)
-    attacked_recall_rate = attacked_recall / max(gt_count, 1)
-    
-    attack_success_rate_sample = attack_success / max(orig_detected_count, 1)
-    attack_success_rate_target = (original_recall - attacked_recall) / max(original_recall, 1) if original_recall > 0 else 0.0
+    results = metrics.compute()
     
     logger.info('=' * 70)
     logger.info('Attack Results for 4D Radar Data:')
@@ -321,32 +349,18 @@ def evaluate_attack(model, dataloader, args, logger):
         logger.info(f'PGD Steps: {args.pgd_steps}')
     if args.attack_domain == 'point':
         logger.info(f'Voxel Mode: {args.voxel_mode}')
-        logger.info(f'Max |delta|: {max_abs_perturbation:.6f}')
-        logger.info(
-            f'Mean |delta|: '
-            f'{mean_abs_perturbation / max(perturbation_batches, 1):.6f}'
-        )
-    logger.info(f'Total Samples: {total_samples}')
-    logger.info(f'Original Recall@0.5: {original_recall_rate:.4f}')
-    logger.info(f'Attacked Recall@0.5: {attacked_recall_rate:.4f}')
-    logger.info(f'Attack Success Rate (Sample): {attack_success_rate_sample:.4f}')
-    logger.info(f'Attack Success Rate (Target): {attack_success_rate_target:.4f}')
-    logger.info(f'Recall Drop: {(original_recall_rate - attacked_recall_rate):.4f}')
+        logger.info(f'Max |delta|: {results["max_abs_perturbation"]:.6f}')
+        logger.info(f'Mean |delta|: {results["mean_abs_perturbation"]:.6f}')
+        if writer is not None:
+            logger.info(f'Saved adversarial point clouds: {writer.saved_samples}')
+            logger.info(f'Adversarial manifest: {writer.manifest_path}')
+    logger.info(f'Total Samples: {results["total_samples"]}')
+    logger.info(f'Original Recall@0.5: {results["original_recall"]:.4f}')
+    logger.info(f'Attacked Recall@0.5: {results["attacked_recall"]:.4f}')
+    logger.info(f'Attack Success Rate (Sample): {results["attack_success_rate_sample"]:.4f}')
+    logger.info(f'Attack Success Rate (Target): {results["attack_success_rate_target"]:.4f}')
+    logger.info(f'Recall Drop: {results["recall_drop"]:.4f}')
     logger.info('=' * 70)
-    
-    results = {
-        'total_samples': total_samples,
-        'original_recall': original_recall_rate,
-        'attacked_recall': attacked_recall_rate,
-        'attack_success_rate_sample': attack_success_rate_sample,
-        'attack_success_rate_target': attack_success_rate_target,
-        'recall_drop': original_recall_rate - attacked_recall_rate
-    }
-    if args.attack_domain == 'point':
-        results['max_abs_perturbation'] = max_abs_perturbation
-        results['mean_abs_perturbation'] = (
-            mean_abs_perturbation / max(perturbation_batches, 1)
-        )
     return results
 
 
@@ -392,7 +406,7 @@ def main():
     model.cuda()
 
     logger.info('Starting attack evaluation on 4D radar data...')
-    results = evaluate_attack(model, test_loader, args, logger)
+    results = evaluate_attack(model, test_loader, args, logger, output_dir)
 
     with open(output_dir / 'attack_results.txt', 'w') as f:
         f.write('4D Radar Attack Results\n')

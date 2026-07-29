@@ -14,8 +14,12 @@ tensor.
 | File | Attack Type | Target Data | Description |
 |------|-------------|-------------|-------------|
 | `fgsm_attack.py` | FGSM | Generic point cloud | Original non-radar point attack script |
-| `fgsm_attack_radar.py` | FGSM / PGD | 4D radar | Supports both voxel and raw-point attack domains |
-| `radar_point_attack.py` | FGSM / PGD | 4D radar points | Differentiable hard-voxelization utilities used by the radar script |
+| `../radar_attack/run_attack.py` | FGSM / PGD | 4D radar | Canonical experiment entry point |
+| `../radar_attack/attacks/` | FGSM / PGD | Raw 4D radar points | Reusable attacks with a unified output object |
+| `../radar_attack/adapters/` | - | OpenPCDet | Differentiable hard-voxelization adapter |
+| `../radar_attack/evaluation/` | - | Raw 4D radar points | Metrics and adversarial point-cloud persistence |
+| `fgsm_attack_radar.py` | FGSM / PGD | 4D radar | Backward-compatible legacy CLI |
+| `radar_point_attack.py` | FGSM / PGD | 4D radar points | Backward-compatible import shim |
 
 ## Attack Features
 
@@ -52,7 +56,7 @@ independently, padding is never attacked, and xyz coordinates are projected
 back into their original pillar.
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_domain point \
@@ -66,7 +70,7 @@ python attacks/fgsm_attack_radar.py \
 ### Point-level PGD with per-feature budgets
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_domain point \
@@ -79,13 +83,14 @@ python attacks/fgsm_attack_radar.py \
     --epsilon_time 0.01 \
     --pgd_steps 10 \
     --random_start \
-    --voxel_mode fixed
+    --voxel_mode fixed \
+    --save_adv
 ```
 
 ### Point-level PGD allowing points to cross pillars
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_domain point \
@@ -104,7 +109,7 @@ assignment is reused and coordinates cannot cross a voxel boundary.
 ### Voxel-level FGSM
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_domain voxel \
@@ -117,7 +122,7 @@ python attacks/fgsm_attack_radar.py \
 ### Voxel-level PGD
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_type pgd \
@@ -130,7 +135,7 @@ python attacks/fgsm_attack_radar.py \
 ### Attack All Features
 
 ```bash
-python attacks/fgsm_attack_radar.py \
+python radar_attack/run_attack.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
     --attack_type pgd \
@@ -157,6 +162,10 @@ python attacks/fgsm_attack_radar.py \
 | `--voxel_mode` | str | fixed | Point attack topology: `fixed` or `revoxelize` |
 | `--random_start` | flag | off | Random PGD initialization inside the budget |
 | `--num_samples` | int | None | Number of samples to attack (None = all) |
+| `--score_threshold` | float | 0.5 | Confidence threshold for sample-level success |
+| `--save_adv` | flag | off | Save adversarial raw point clouds; requires point domain |
+| `--adv_format` | str | npy | Saved point-cloud format: `npy` or headerless `bin` |
+| `--adv_dir` | str | None | Custom save directory; defaults inside experiment output |
 | `--batch_size` | int | 1 | Batch size |
 | `--workers` | int | 4 | Number of DataLoader workers (set to 0 if encountering segmentation faults) |
 
@@ -176,17 +185,17 @@ python attacks/fgsm_attack_radar.py \
 
 ### Quick Test
 ```bash
-python attacks/fgsm_attack_radar.py --attack_type fgsm --epsilon 0.05 --num_samples 100 --workers 0
+python radar_attack/run_attack.py --attack_type fgsm --epsilon 0.05 --num_samples 100 --workers 0
 ```
 
 ### Standard Evaluation
 ```bash
-python attacks/fgsm_attack_radar.py --attack_type pgd --pgd_steps 10 --epsilon 0.05 --num_samples 1296 --workers 4
+python radar_attack/run_attack.py --attack_type pgd --pgd_steps 10 --epsilon 0.05 --num_samples 1296 --workers 4
 ```
 
 ### High-Strength Attack
 ```bash
-python attacks/fgsm_attack_radar.py --attack_type pgd --pgd_steps 20 --epsilon 0.1 --num_samples 1296
+python radar_attack/run_attack.py --attack_type pgd --pgd_steps 20 --epsilon 0.1 --num_samples 1296
 ```
 
 ## Common Issues
@@ -194,7 +203,7 @@ python attacks/fgsm_attack_radar.py --attack_type pgd --pgd_steps 20 --epsilon 0
 ### Segmentation Fault
 If you encounter a segmentation fault with `workers > 0`, try:
 ```bash
-python attacks/fgsm_attack_radar.py --workers 0
+python radar_attack/run_attack.py --workers 0
 ```
 
 ### ModuleNotFoundError: _init_path
@@ -207,9 +216,9 @@ This is caused by model state pollution during attack. The script now properly s
 
 Standard hard-voxelized PointPillars consumes `batch_dict['voxels']`, not
 `batch_dict['points']`. Simply setting raw points to `requires_grad=True`
-therefore does not work. The `--attack_domain point` branch in
-`fgsm_attack_radar.py` solves this by rebuilding voxels from the raw point
-tensor while keeping the gathered point features connected to autograd.
+therefore does not work. The `--attack_domain point` branch solves this by
+rebuilding voxels from the raw point tensor while keeping the gathered point
+features connected to autograd.
 BatchNorm statistics are frozen during loss computation.
 
 ## Output Files
@@ -218,6 +227,20 @@ Results are saved to:
 ```
 output/<exp_group>/<tag>/<extra_tag>/attack_results.txt
 ```
+
+With `--save_adv`, every sample is additionally saved as a raw feature array
+without OpenPCDet's leading batch-index column:
+
+```
+output/<exp_group>/<tag>/<extra_tag>/adversarial_points/<frame_id>.npy
+output/<exp_group>/<tag>/<extra_tag>/adversarial_points/manifest.jsonl
+```
+
+The manifest records feature order, tensor shape, dtype, attack settings, and
+per-frame perturbation statistics. A `.bin` file is headerless float32 data;
+use its manifest `shape` field when loading it. These are adversarial point
+clouds, not voxel tensors, so they can be passed through another detector's
+own preprocessing for transfer-attack evaluation.
 
 ## References
 
