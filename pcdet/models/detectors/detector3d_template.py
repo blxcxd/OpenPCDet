@@ -364,10 +364,15 @@ class Detector3DTemplate(nn.Module):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        # OpenPCDet checkpoints include optimizer/version metadata in addition
+        # to tensors. PyTorch 2.6+ defaults to weights_only=True, which rejects
+        # these trusted legacy checkpoints.
+        checkpoint = torch.load(filename, map_location=loc_type, weights_only=False)
         model_state_disk = checkpoint['model_state']
         if not pre_trained_path is None:
-            pretrain_checkpoint = torch.load(pre_trained_path, map_location=loc_type)
+            pretrain_checkpoint = torch.load(
+                pre_trained_path, map_location=loc_type, weights_only=False
+            )
             pretrain_model_state_disk = pretrain_checkpoint['model_state']
             model_state_disk.update(pretrain_model_state_disk)
             
