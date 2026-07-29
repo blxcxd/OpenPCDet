@@ -15,6 +15,13 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils import common_utils
 
+from attacks.radar_point_attack import (
+    PointCloudVoxelizer,
+    get_feature_names,
+    get_voxel_settings,
+    point_cloud_attack,
+)
+
 
 def parse_config():
     parser = argparse.ArgumentParser(description='FGSM Attack on PointPillars for 4D Radar')
@@ -24,12 +31,30 @@ def parse_config():
     parser.add_argument('--extra_tag', type=str, default='fgsm_attack_radar', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, required=True, help='checkpoint to load')
     parser.add_argument('--epsilon', type=float, default=0.05, help='FGSM epsilon (perturbation size)')
+    parser.add_argument('--attack_domain', type=str, default='voxel',
+                        choices=['voxel', 'point'],
+                        help='attack voxel tensor or raw 4D-radar points')
     parser.add_argument('--attack_feature', type=str, default='all', 
-                        choices=['all', 'xyz', 'doppler', 'intensity'],
+                        choices=['all', 'xyz', 'doppler', 'intensity', 'rcs', 'time'],
                         help='which features to perturb')
     parser.add_argument('--attack_type', type=str, default='fgsm', choices=['fgsm', 'pgd'], 
                         help='attack type: fgsm or pgd')
     parser.add_argument('--pgd_steps', type=int, default=5, help='PGD steps')
+    parser.add_argument('--step_size', type=float, default=None,
+                        help='point PGD step size (default: 2 * epsilon / steps)')
+    parser.add_argument('--epsilon_xyz', type=float, default=None,
+                        help='point attack xyz budget, overriding epsilon')
+    parser.add_argument('--epsilon_rcs', type=float, default=None,
+                        help='point attack RCS budget, overriding epsilon')
+    parser.add_argument('--epsilon_doppler', type=float, default=None,
+                        help='point attack Doppler budget, overriding epsilon')
+    parser.add_argument('--epsilon_time', type=float, default=None,
+                        help='point attack timestamp budget, overriding epsilon')
+    parser.add_argument('--random_start', action='store_true',
+                        help='use a random PGD start for point attack')
+    parser.add_argument('--voxel_mode', type=str, default='fixed',
+                        choices=['fixed', 'revoxelize'],
+                        help='point topology: fixed pillars or per-step revoxelization')
     parser.add_argument('--num_samples', type=int, default=None, help='number of samples to attack')
     parser.add_argument('--save_adv', action='store_true', default=False, help='save adversarial samples')
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
@@ -38,6 +63,15 @@ def parse_config():
                         help='set extra config keys if needed')
 
     args = parser.parse_args()
+
+    if args.epsilon < 0:
+        parser.error('--epsilon must be non-negative')
+    if args.pgd_steps <= 0:
+        parser.error('--pgd_steps must be positive')
+    for name in ['epsilon_xyz', 'epsilon_rcs', 'epsilon_doppler', 'epsilon_time']:
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error(f'--{name} must be non-negative')
 
     cfg_from_yaml_file(args.cfg_file, cfg)
     cfg.TAG = Path(args.cfg_file).stem
@@ -59,9 +93,14 @@ def apply_perturbation_mask(points, perturbation, attack_feature):
     elif attack_feature == 'doppler':
         mask[..., :4] = 0.0
         mask[..., 5:] = 0.0
-    elif attack_feature == 'intensity':
+    elif attack_feature in ['intensity', 'rcs']:
         mask[..., :3] = 0.0
         mask[..., 4:] = 0.0
+    elif attack_feature == 'time':
+        mask.zero_()
+        if points.shape[-1] <= 6:
+            raise ValueError('time attack requires a time feature at index 6')
+        mask[..., 6] = 1.0
     
     return perturbation * mask
 
@@ -168,6 +207,19 @@ def evaluate_attack(model, dataloader, args, logger):
     original_recall = 0
     attacked_recall = 0
     gt_count = 0
+    max_abs_perturbation = 0.0
+    mean_abs_perturbation = 0.0
+    perturbation_batches = 0
+
+    if args.attack_domain == 'point':
+        voxel_size, max_points, max_voxels = get_voxel_settings(cfg.DATA_CONFIG)
+        feature_names = get_feature_names(cfg.DATA_CONFIG)
+        epsilon_overrides = {
+            'xyz': args.epsilon_xyz,
+            'rcs': args.epsilon_rcs,
+            'doppler': args.epsilon_doppler,
+            'time': args.epsilon_time,
+        }
     
     if args.num_samples is not None:
         total_iters = min(args.num_samples, len(dataloader))
@@ -183,17 +235,52 @@ def evaluate_attack(model, dataloader, args, logger):
         load_data_to_gpu(batch_dict)
         
         with torch.no_grad():
-            pred_dicts_original, ret_dict_original = model(batch_dict)
-        
-        if args.attack_type == 'fgsm':
-            perturbed_voxels = fgsm_attack_voxel(model, batch_dict, args.epsilon, args.attack_feature)
+            pred_dicts_original, ret_dict_original = model(dict(batch_dict))
+
+        if args.attack_domain == 'point':
+            voxelizer = PointCloudVoxelizer(
+                cfg.DATA_CONFIG.POINT_CLOUD_RANGE,
+                voxel_size,
+                max_points,
+                max_voxels,
+                int(batch_dict['batch_size']),
+            )
+            perturbed_points, voxel_data, perturbation_stats = point_cloud_attack(
+                model=model,
+                batch_dict=batch_dict,
+                voxelizer=voxelizer,
+                feature_names=feature_names,
+                attack_type=args.attack_type,
+                attack_feature=args.attack_feature,
+                epsilon=args.epsilon,
+                epsilon_overrides=epsilon_overrides,
+                pgd_steps=args.pgd_steps,
+                step_size=args.step_size,
+                random_start=args.random_start,
+                voxel_mode=args.voxel_mode,
+            )
+            batch_dict['points'] = perturbed_points
+            batch_dict.update(voxel_data)
+            max_abs_perturbation = max(
+                max_abs_perturbation,
+                perturbation_stats['max_abs_perturbation'],
+            )
+            mean_abs_perturbation += perturbation_stats['mean_abs_perturbation']
+            perturbation_batches += 1
+        elif args.attack_type == 'fgsm':
+            perturbed_voxels = fgsm_attack_voxel(
+                model, batch_dict, args.epsilon, args.attack_feature
+            )
+            batch_dict['voxels'] = perturbed_voxels
         else:
-            perturbed_voxels = pgd_attack_voxel(model, batch_dict, args.epsilon, args.attack_feature, args.pgd_steps)
-        
-        batch_dict['voxels'] = perturbed_voxels
+            perturbed_voxels = pgd_attack_voxel(
+                model, batch_dict, args.epsilon,
+                args.attack_feature, args.pgd_steps
+            )
+            batch_dict['voxels'] = perturbed_voxels
         
         with torch.no_grad():
-            pred_dicts_attacked, ret_dict_attacked = model(batch_dict)
+            pred_dicts_attacked, ret_dict_attacked = model(dict(batch_dict))
         
         original_recall += ret_dict_original.get('rcnn_0.5', 0)
         attacked_recall += ret_dict_attacked.get('rcnn_0.5', 0)
@@ -226,11 +313,19 @@ def evaluate_attack(model, dataloader, args, logger):
     
     logger.info('=' * 70)
     logger.info('Attack Results for 4D Radar Data:')
+    logger.info(f'Attack Domain: {args.attack_domain}')
     logger.info(f'Attack Type: {args.attack_type.upper()}')
     logger.info(f'Epsilon: {args.epsilon}')
     logger.info(f'Attack Feature: {args.attack_feature}')
     if args.attack_type == 'pgd':
         logger.info(f'PGD Steps: {args.pgd_steps}')
+    if args.attack_domain == 'point':
+        logger.info(f'Voxel Mode: {args.voxel_mode}')
+        logger.info(f'Max |delta|: {max_abs_perturbation:.6f}')
+        logger.info(
+            f'Mean |delta|: '
+            f'{mean_abs_perturbation / max(perturbation_batches, 1):.6f}'
+        )
     logger.info(f'Total Samples: {total_samples}')
     logger.info(f'Original Recall@0.5: {original_recall_rate:.4f}')
     logger.info(f'Attacked Recall@0.5: {attacked_recall_rate:.4f}')
@@ -239,7 +334,7 @@ def evaluate_attack(model, dataloader, args, logger):
     logger.info(f'Recall Drop: {(original_recall_rate - attacked_recall_rate):.4f}')
     logger.info('=' * 70)
     
-    return {
+    results = {
         'total_samples': total_samples,
         'original_recall': original_recall_rate,
         'attacked_recall': attacked_recall_rate,
@@ -247,6 +342,12 @@ def evaluate_attack(model, dataloader, args, logger):
         'attack_success_rate_target': attack_success_rate_target,
         'recall_drop': original_recall_rate - attacked_recall_rate
     }
+    if args.attack_domain == 'point':
+        results['max_abs_perturbation'] = max_abs_perturbation
+        results['mean_abs_perturbation'] = (
+            mean_abs_perturbation / max(perturbation_batches, 1)
+        )
+    return results
 
 
 def main():
@@ -296,17 +397,23 @@ def main():
     with open(output_dir / 'attack_results.txt', 'w') as f:
         f.write('4D Radar Attack Results\n')
         f.write('=' * 40 + '\n')
+        f.write(f'Attack Domain: {args.attack_domain}\n')
         f.write(f'Attack Type: {args.attack_type}\n')
         f.write(f'Epsilon: {args.epsilon}\n')
         f.write(f'Attack Feature: {args.attack_feature}\n')
         if args.attack_type == 'pgd':
             f.write(f'PGD Steps: {args.pgd_steps}\n')
+        if args.attack_domain == 'point':
+            f.write(f'Voxel Mode: {args.voxel_mode}\n')
         f.write(f'Total Samples: {results["total_samples"]}\n')
         f.write(f'Original Recall@0.5: {results["original_recall"]:.4f}\n')
         f.write(f'Attacked Recall@0.5: {results["attacked_recall"]:.4f}\n')
         f.write(f'Attack Success Rate (Sample): {results["attack_success_rate_sample"]:.4f}\n')
         f.write(f'Attack Success Rate (Target): {results["attack_success_rate_target"]:.4f}\n')
         f.write(f'Recall Drop: {results["recall_drop"]:.4f}\n')
+        if args.attack_domain == 'point':
+            f.write(f'Max |delta|: {results["max_abs_perturbation"]:.6f}\n')
+            f.write(f'Mean |delta|: {results["mean_abs_perturbation"]:.6f}\n')
 
     logger.info('Attack evaluation finished. Results saved to %s' % output_dir)
 

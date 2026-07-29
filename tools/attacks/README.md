@@ -4,14 +4,18 @@ This tool provides adversarial attack implementations for 4D radar-based 3D obje
 
 ## Overview
 
-The attack scripts implement FGSM (Fast Gradient Sign Method) and PGD (Projected Gradient Descent) attacks on PointPillar models using 4D radar data. The attacks can be applied at the voxel level, targeting different feature dimensions (xyz, doppler, intensity, or all features).
+The attack scripts implement FGSM (Fast Gradient Sign Method) and PGD
+(Projected Gradient Descent) attacks on PointPillars models using 4D radar
+data. Attacks can optimize either the raw points or the already voxelized
+tensor.
 
 ## Files
 
 | File | Attack Type | Target Data | Description |
 |------|-------------|-------------|-------------|
-| `fgsm_attack.py` | FGSM | Point cloud | Attacks raw point cloud data (point-level) |
-| `fgsm_attack_radar.py` | FGSM / PGD | Voxel | Attacks voxelized 4D radar data (voxel-level) |
+| `fgsm_attack.py` | FGSM | Generic point cloud | Original non-radar point attack script |
+| `fgsm_attack_radar.py` | FGSM / PGD | 4D radar | Supports both voxel and raw-point attack domains |
+| `radar_point_attack.py` | FGSM / PGD | 4D radar points | Differentiable hard-voxelization utilities used by the radar script |
 
 ## Attack Features
 
@@ -41,19 +45,76 @@ conda activate openpcdet
 cd /path/to/OpenPCDet/tools
 ```
 
-### FGSM Attack
+### Point-level FGSM (fixed pillar membership)
+
+This is the recommended first experiment. Every valid point is optimized
+independently, padding is never attacked, and xyz coordinates are projected
+back into their original pillar.
 
 ```bash
 python attacks/fgsm_attack_radar.py \
     --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
     --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_type fgsm \
+    --attack_feature xyz \
+    --epsilon 0.05 \
+    --voxel_mode fixed \
+    --num_samples 100
+```
+
+### Point-level PGD with per-feature budgets
+
+```bash
+python attacks/fgsm_attack_radar.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_type pgd \
+    --attack_feature all \
+    --epsilon 0.05 \
+    --epsilon_xyz 0.10 \
+    --epsilon_rcs 1.0 \
+    --epsilon_doppler 0.20 \
+    --epsilon_time 0.01 \
+    --pgd_steps 10 \
+    --random_start \
+    --voxel_mode fixed
+```
+
+### Point-level PGD allowing points to cross pillars
+
+```bash
+python attacks/fgsm_attack_radar.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_type pgd \
+    --attack_feature xyz \
+    --epsilon 0.20 \
+    --pgd_steps 10 \
+    --voxel_mode revoxelize
+```
+
+Hard voxel assignment is discrete. In `revoxelize` mode, the script rebuilds
+the true hard voxels before every forward pass and uses a BPDA/straight-through
+gradient through the point-feature gather. In `fixed` mode, the original
+assignment is reused and coordinates cannot cross a voxel boundary.
+
+### Voxel-level FGSM
+
+```bash
+python attacks/fgsm_attack_radar.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt ../output/kitti_models/pointpillar_radar/default/ckpt/checkpoint_epoch_80.pth \
+    --attack_domain voxel \
     --attack_type fgsm \
     --attack_feature xyz \
     --epsilon 0.05 \
     --num_samples 1296
 ```
 
-### PGD Attack
+### Voxel-level PGD
 
 ```bash
 python attacks/fgsm_attack_radar.py \
@@ -84,10 +145,17 @@ python attacks/fgsm_attack_radar.py \
 |-----------|------|---------|-------------|
 | `--cfg_file` | str | - | Path to model configuration file |
 | `--ckpt` | str | - | Path to trained model checkpoint |
+| `--attack_domain` | str | voxel | Radar attack domain: `voxel` or `point` |
 | `--attack_type` | str | fgsm | Attack type: `fgsm` or `pgd` |
 | `--attack_feature` | str | all | Target feature: `xyz`, `doppler`, `intensity`, or `all` |
 | `--epsilon` | float | 0.05 | Perturbation magnitude |
-| `--pgd_steps` | int | 5 | Number of PGD iterations |
+| `--epsilon_xyz` | float | None | Point attack xyz budget (overrides epsilon) |
+| `--epsilon_rcs` | float | None | Point attack RCS budget (overrides epsilon) |
+| `--epsilon_doppler` | float | None | Point attack velocity budget (overrides epsilon) |
+| `--epsilon_time` | float | None | Point attack time budget (overrides epsilon) |
+| `--pgd_steps` | int | 10 point / 5 voxel | Number of PGD iterations |
+| `--voxel_mode` | str | fixed | Point attack topology: `fixed` or `revoxelize` |
+| `--random_start` | flag | off | Random PGD initialization inside the budget |
 | `--num_samples` | int | None | Number of samples to attack (None = all) |
 | `--batch_size` | int | 1 | Batch size |
 | `--workers` | int | 4 | Number of DataLoader workers (set to 0 if encountering segmentation faults) |
@@ -100,6 +168,7 @@ python attacks/fgsm_attack_radar.py \
 | `Attacked Recall@0.5` | Recall after attack |
 | `Attack Success Rate` | Number of successfully attacked samples / Number of originally detected samples |
 | `Recall Drop` | Original Recall - Attacked Recall |
+| `Max / Mean \|delta\|` | Raw point-feature perturbation statistics |
 
 **Important**: The Attack Success Rate is calculated only on samples where the model originally detected at least one target with confidence >= 0.5.
 
@@ -133,6 +202,15 @@ Make sure you run the script from the `tools/` directory, not from the project r
 
 ### Different Original Recall Across Runs
 This is caused by model state pollution during attack. The script now properly saves and restores model state.
+
+### Raw points have no gradient
+
+Standard hard-voxelized PointPillars consumes `batch_dict['voxels']`, not
+`batch_dict['points']`. Simply setting raw points to `requires_grad=True`
+therefore does not work. The `--attack_domain point` branch in
+`fgsm_attack_radar.py` solves this by rebuilding voxels from the raw point
+tensor while keeping the gathered point features connected to autograd.
+BatchNorm statistics are frozen during loss computation.
 
 ## Output Files
 
