@@ -76,17 +76,31 @@ def project_points(
     spatial_min = projected.new_tensor(point_cloud_range[:3])
     spatial_max = projected.new_tensor(point_cloud_range[3:])
     margin = max(min(float(x) for x in voxel_size) * 1e-4, 1e-6)
-    projected[:, 1:4] = torch.maximum(
+    original_in_range = (
+        (original[:, 1:4] >= spatial_min)
+        & (original[:, 1:4] < spatial_max)
+    ).all(dim=1)
+    bounded_xyz = torch.maximum(
         torch.minimum(projected[:, 1:4], spatial_max - margin), spatial_min
+    )
+    projected[:, 1:4] = torch.where(
+        original_in_range.unsqueeze(1),
+        bounded_xyz,
+        original[:, 1:4],
     )
 
     if voxel_mode == 'fixed':
         size = projected.new_tensor(voxel_size)
         original_cell = torch.floor((original[:, 1:4] - spatial_min) / size)
         cell_min = spatial_min + original_cell * size
-        projected[:, 1:4] = torch.maximum(
+        fixed_xyz = torch.maximum(
             torch.minimum(projected[:, 1:4], cell_min + size - margin),
             cell_min,
+        )
+        projected[:, 1:4] = torch.where(
+            original_in_range.unsqueeze(1),
+            fixed_xyz,
+            original[:, 1:4],
         )
     return projected
 

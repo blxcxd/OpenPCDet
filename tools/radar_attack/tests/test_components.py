@@ -8,7 +8,13 @@ import torch
 import torch.nn as nn
 
 from tools.radar_attack.adapters.openpcdet import PointCloudVoxelizer
-from tools.radar_attack.attacks import AttackOutput, point_cloud_attack
+from tools.radar_attack.attacks import (
+    AttackOutput,
+    build_feature_mask,
+    point_cloud_attack,
+    voxel_attack,
+)
+from tools.radar_attack.attacks.gradient import project_points
 from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
@@ -21,6 +27,49 @@ class SumVoxelModel(nn.Module):
 
 
 class RadarAttackComponentTest(unittest.TestCase):
+    def test_projection_does_not_move_points_outside_model_z_range(self):
+        original = torch.tensor(
+            [[0.0, 1.0, 2.0, 6.0, 4.0, -2.0, -3.0, 0.01]]
+        )
+        budget = torch.tensor(
+            [[0.0, 0.01, 0.01, 0.01, 0.0, 0.0, 0.0, 0.0]]
+        )
+        candidate = original + budget
+
+        projected = project_points(
+            candidate,
+            original,
+            budget,
+            point_cloud_range=[0, -25.6, -3, 51.2, 25.6, 2],
+            voxel_size=[0.16, 0.16, 5],
+            voxel_mode='fixed',
+        )
+
+        self.assertTrue(torch.equal(projected[:, 1:4], original[:, 1:4]))
+
+    def test_voxel_doppler_attack_selects_both_velocity_channels(self):
+        voxels = torch.tensor(
+            [[[1.0, 2.0, 0.0, 4.0, -2.0, -3.0, 0.01]]]
+        )
+        model = SumVoxelModel()
+        model.eval()
+
+        adversarial = voxel_attack(
+            model=model,
+            batch_dict={'voxels': voxels},
+            epsilon=0.1,
+            attack_type='fgsm',
+            attack_feature='doppler',
+            point_cloud_range=[0, -25.6, -3, 51.2, 25.6, 2],
+        )
+
+        expected = voxels.clone()
+        expected[..., 4:6] += 0.1
+        self.assertTrue(torch.allclose(adversarial, expected))
+        self.assertFalse(model.training)
+        mask = build_feature_mask(voxels, 'doppler')
+        self.assertEqual(mask.flatten().tolist(), [0, 0, 0, 0, 1, 1, 0])
+
     def test_point_fgsm_returns_raw_adversarial_points(self):
         points = torch.tensor(
             [

@@ -9,13 +9,21 @@ The attack scripts implement FGSM (Fast Gradient Sign Method) and PGD
 data. Attacks can optimize either the raw points or the already voxelized
 tensor.
 
+`tools/radar_attack/` owns the complete CLI, experiment runner, attacks,
+OpenPCDet adapter, persistence, and metrics. It does not import implementation
+code from `tools/attacks/`; the old radar script is retained only as a
+forwarding entry point. The package remains inside OpenPCDet because its runner
+intentionally uses OpenPCDet for datasets, model losses, and inference.
+
 ## Files
 
 | File | Attack Type | Target Data | Description |
 |------|-------------|-------------|-------------|
 | `fgsm_attack.py` | FGSM | Generic point cloud | Original non-radar point attack script |
 | `../radar_attack/run_attack.py` | FGSM / PGD | 4D radar | Canonical experiment entry point |
-| `../radar_attack/attacks/` | FGSM / PGD | Raw 4D radar points | Reusable attacks with a unified output object |
+| `../radar_attack/runner.py` | FGSM / PGD | 4D radar | OpenPCDet model/data experiment loop |
+| `../radar_attack/attacks/gradient.py` | FGSM / PGD | Raw 4D radar points | Point attacks with a unified output object |
+| `../radar_attack/attacks/voxel.py` | FGSM / PGD | Radar voxels | Voxel-domain baseline attacks |
 | `../radar_attack/adapters/` | - | OpenPCDet | Differentiable hard-voxelization adapter |
 | `../radar_attack/evaluation/` | - | Raw 4D radar points | Metrics and adversarial point-cloud persistence |
 | `fgsm_attack_radar.py` | FGSM / PGD | 4D radar | Backward-compatible legacy CLI |

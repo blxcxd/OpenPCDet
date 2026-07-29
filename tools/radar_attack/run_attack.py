@@ -8,7 +8,7 @@ if str(TOOLS_DIR) in sys.path:
     sys.path.remove(str(TOOLS_DIR))
 sys.path.insert(0, str(TOOLS_DIR))
 
-from attacks.fgsm_attack_radar import main
+from radar_attack.runner import main
 
 
 if __name__ == '__main__':
