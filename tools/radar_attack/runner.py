@@ -1,7 +1,9 @@
 """OpenPCDet experiment runner for 4D-radar adversarial attacks."""
 
-import sys
+import json
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import datetime
@@ -26,6 +28,9 @@ from radar_attack.attacks.voxel import voxel_attack
 from radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    evaluate_vod_pair,
+    prepare_prediction_directory,
+    resolve_vod_label_dir,
 )
 
 
@@ -34,6 +39,8 @@ def parse_config():
     parser.add_argument('--cfg_file', type=str, required=True, help='specify the config for training')
     parser.add_argument('--batch_size', type=int, default=1, help='batch size for attack')
     parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
+    parser.add_argument('--seed', type=int, default=1024,
+                        help='random seed for reproducible attacks')
     parser.add_argument('--extra_tag', type=str, default='fgsm_attack_radar', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, required=True, help='checkpoint to load')
     parser.add_argument('--epsilon', type=float, default=0.05, help='FGSM epsilon (perturbation size)')
@@ -69,6 +76,16 @@ def parse_config():
                         help='saved adversarial point-cloud format')
     parser.add_argument('--score_threshold', type=float, default=0.5,
                         help='confidence threshold used by sample-level attack success rate')
+    parser.add_argument('--vod_eval', dest='vod_eval', action='store_true',
+                        default=True, help='run the official VoD clean/adv evaluation')
+    parser.add_argument('--no_vod_eval', dest='vod_eval', action='store_false',
+                        help='skip the official VoD evaluation')
+    parser.add_argument('--vod_devkit', type=str, default='~/VoD-evaluation',
+                        help='path to the official View-of-Delft devkit')
+    parser.add_argument('--vod_label_dir', type=str, default=None,
+                        help='VoD label_2 directory (default: dataset training/label_2)')
+    parser.add_argument('--vod_score_threshold', type=float, default=-1.0,
+                        help='official evaluator score filter; -1 keeps all model outputs')
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--local_rank', type=int, default=None, help='local rank for distributed training')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
@@ -78,6 +95,8 @@ def parse_config():
 
     if args.epsilon < 0:
         parser.error('--epsilon must be non-negative')
+    if args.seed < 0:
+        parser.error('--seed must be non-negative')
     if args.pgd_steps <= 0:
         parser.error('--pgd_steps must be positive')
     if args.step_size is not None and args.step_size <= 0:
@@ -88,6 +107,8 @@ def parse_config():
         parser.error('--score_threshold must be in [0, 1]')
     if args.save_adv and args.attack_domain != 'point':
         parser.error('--save_adv requires --attack_domain point')
+    if args.vod_eval and args.launcher != 'none':
+        parser.error('official VoD evaluation currently requires --launcher none')
     for name in ['epsilon_xyz', 'epsilon_rcs', 'epsilon_doppler', 'epsilon_time']:
         value = getattr(args, name)
         if value is not None and value < 0:
@@ -97,7 +118,9 @@ def parse_config():
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])
 
-    np.random.seed(1024)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
@@ -109,7 +132,39 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     model.eval()
     metrics = DetectionAttackMetrics(score_threshold=args.score_threshold)
     writer = None
+    dataset = dataloader.dataset
     feature_names = get_feature_names(cfg.DATA_CONFIG)
+    clean_prediction_dir = None
+    adversarial_prediction_dir = None
+    vod_label_dir = None
+
+    if args.vod_eval:
+        prediction_root = output_dir / 'vod_predictions'
+        clean_prediction_dir = prepare_prediction_directory(
+            prediction_root / 'clean'
+        )
+        adversarial_prediction_dir = prepare_prediction_directory(
+            prediction_root / 'adversarial'
+        )
+        vod_label_dir = resolve_vod_label_dir(
+            dataset,
+            args.vod_label_dir,
+        )
+        logger.info('Official VoD labels: %s', vod_label_dir)
+        logger.info('Clean VoD predictions: %s', clean_prediction_dir)
+        logger.info(
+            'Adversarial VoD predictions: %s',
+            adversarial_prediction_dir,
+        )
+        model_score_threshold = float(
+            cfg.MODEL.POST_PROCESSING.SCORE_THRESH
+        )
+        if model_score_threshold > 0:
+            logger.warning(
+                'MODEL.POST_PROCESSING.SCORE_THRESH=%s removes lower-score '
+                'predictions before VoD AP evaluation',
+                model_score_threshold,
+            )
 
     if args.attack_domain == 'point':
         voxel_size, max_points, max_voxels = get_voxel_settings(cfg.DATA_CONFIG)
@@ -130,6 +185,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 feature_names=feature_names,
                 file_format=args.adv_format,
                 run_metadata={
+                    'seed': args.seed,
                     'attack_domain': args.attack_domain,
                     'attack_type': args.attack_type,
                     'attack_feature': args.attack_feature,
@@ -169,6 +225,13 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
 
         with torch.no_grad():
             pred_dicts_original, ret_dict_original = model(dict(batch_dict))
+        if clean_prediction_dir is not None:
+            dataset.generate_prediction_dicts(
+                batch_dict,
+                pred_dicts_original,
+                dataset.class_names,
+                output_path=clean_prediction_dir,
+            )
 
         if args.attack_domain == 'point':
             original_points = batch_dict['points'].detach().clone()
@@ -216,6 +279,13 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
 
         with torch.no_grad():
             pred_dicts_attacked, ret_dict_attacked = model(dict(batch_dict))
+        if adversarial_prediction_dir is not None:
+            dataset.generate_prediction_dicts(
+                batch_dict,
+                pred_dicts_attacked,
+                dataset.class_names,
+                output_path=adversarial_prediction_dir,
+            )
 
         metrics.update_predictions(
             pred_dicts_original,
@@ -227,6 +297,19 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
 
     progress_bar.close()
     results = metrics.compute()
+    if clean_prediction_dir is not None:
+        logger.info('Running official VoD evaluator for clean predictions...')
+        results['vod_official'] = evaluate_vod_pair(
+            clean_prediction_dir=clean_prediction_dir,
+            adversarial_prediction_dir=adversarial_prediction_dir,
+            label_dir=vod_label_dir,
+            devkit_path=Path(args.vod_devkit),
+            class_names=dataset.class_names,
+            score_threshold=args.vod_score_threshold,
+        )
+        results['vod_official']['full_validation_set'] = (
+            results['vod_official']['frames'] == len(dataset)
+        )
 
     logger.info('=' * 70)
     logger.info('Attack Results for 4D Radar Data:')
@@ -249,6 +332,25 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     logger.info(f'Attack Success Rate (Sample): {results["attack_success_rate_sample"]:.4f}')
     logger.info(f'Attack Success Rate (Target): {results["attack_success_rate_target"]:.4f}')
     logger.info(f'Recall Drop: {results["recall_drop"]:.4f}')
+    if 'vod_official' in results:
+        vod_results = results['vod_official']
+        for area in ('entire_area', 'roi'):
+            clean_map = vod_results['clean'][area]['3d']['mAP']
+            adversarial_map = vod_results['adversarial'][area]['3d']['mAP']
+            map_drop = vod_results['absolute_drop'][area]['3d']['mAP']
+            logger.info(
+                'VoD %s 3D mAP clean/adv/drop: %.4f / %.4f / %.4f',
+                area,
+                clean_map,
+                adversarial_map,
+                map_drop,
+            )
+        if not vod_results['full_validation_set']:
+            logger.warning(
+                'VoD AP used a %d-frame subset and is not directly comparable '
+                'with full validation-set results',
+                vod_results['frames'],
+            )
     logger.info('=' * 70)
     return results
 
@@ -297,6 +399,13 @@ def main():
     logger.info('Starting attack evaluation on 4D radar data...')
     results = evaluate_attack(model, test_loader, args, logger, output_dir)
 
+    result_payload = {
+        'attack': vars(args),
+        'metrics': results,
+    }
+    with open(output_dir / 'attack_results.json', 'w') as result_file:
+        json.dump(result_payload, result_file, indent=2)
+
     with open(output_dir / 'attack_results.txt', 'w') as f:
         f.write('4D Radar Attack Results\n')
         f.write('=' * 40 + '\n')
@@ -317,6 +426,25 @@ def main():
         if args.attack_domain == 'point':
             f.write(f'Max |delta|: {results["max_abs_perturbation"]:.6f}\n')
             f.write(f'Mean |delta|: {results["mean_abs_perturbation"]:.6f}\n')
+        if 'vod_official' in results:
+            for area in ('entire_area', 'roi'):
+                clean_map = results['vod_official']['clean'][area]['3d']['mAP']
+                adversarial_map = (
+                    results['vod_official']['adversarial'][area]['3d']['mAP']
+                )
+                map_drop = (
+                    results['vod_official']['absolute_drop'][area]['3d']['mAP']
+                )
+                f.write(
+                    f'VoD {area} 3D mAP clean: {clean_map:.4f}\n'
+                )
+                f.write(
+                    f'VoD {area} 3D mAP adversarial: '
+                    f'{adversarial_map:.4f}\n'
+                )
+                f.write(
+                    f'VoD {area} 3D mAP drop: {map_drop:.4f}\n'
+                )
 
     logger.info('Attack evaluation finished. Results saved to %s' % output_dir)
 

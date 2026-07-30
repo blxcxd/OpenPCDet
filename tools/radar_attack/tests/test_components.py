@@ -18,6 +18,12 @@ from tools.radar_attack.attacks.gradient import project_points
 from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    prepare_prediction_directory,
+)
+from tools.radar_attack.evaluation.vod import (
+    _metric_difference,
+    _relative_metric_difference,
+    summarize_vod_results,
 )
 
 
@@ -27,6 +33,49 @@ class SumVoxelModel(nn.Module):
 
 
 class RadarAttackComponentTest(unittest.TestCase):
+    def test_vod_summary_and_attack_drop(self):
+        raw = {
+            area: {
+                f'{class_name}_{suffix}': float(index + metric_index + 1)
+                for index, class_name in enumerate(
+                    ('Car', 'Pedestrian', 'Cyclist')
+                )
+                for metric_index, suffix in enumerate(
+                    ('3d_all', 'bev_all', 'aos_all')
+                )
+            }
+            for area in ('entire_area', 'roi')
+        }
+        clean = summarize_vod_results(raw)
+        adversarial = {
+            area: {
+                metric: {
+                    key: value - 0.5
+                    for key, value in metric_values.items()
+                }
+                for metric, metric_values in area_values.items()
+            }
+            for area, area_values in clean.items()
+        }
+        drop = _metric_difference(clean, adversarial)
+        relative = _relative_metric_difference(clean, drop)
+
+        self.assertEqual(clean['entire_area']['3d']['mAP'], 2.0)
+        self.assertEqual(drop['roi']['bev']['mAP'], 0.5)
+        self.assertEqual(relative['roi']['bev']['mAP'], 0.5 / 3.0)
+
+    def test_prepare_prediction_directory_removes_only_stale_txt(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            (output_dir / 'old.txt').write_text('stale')
+            (output_dir / 'keep.json').write_text('{}')
+
+            prepared = prepare_prediction_directory(output_dir)
+
+            self.assertEqual(prepared, output_dir)
+            self.assertFalse((output_dir / 'old.txt').exists())
+            self.assertTrue((output_dir / 'keep.json').exists())
+
     def test_projection_does_not_move_points_outside_model_z_range(self):
         original = torch.tensor(
             [[0.0, 1.0, 2.0, 6.0, 4.0, -2.0, -3.0, 0.01]]

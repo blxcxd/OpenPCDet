@@ -25,7 +25,8 @@ intentionally uses OpenPCDet for datasets, model losses, and inference.
 | `../radar_attack/attacks/gradient.py` | FGSM / PGD | Raw 4D radar points | Point attacks with a unified output object |
 | `../radar_attack/attacks/voxel.py` | FGSM / PGD | Radar voxels | Voxel-domain baseline attacks |
 | `../radar_attack/adapters/` | - | OpenPCDet | Differentiable hard-voxelization adapter |
-| `../radar_attack/evaluation/` | - | Raw 4D radar points | Metrics and adversarial point-cloud persistence |
+| `../radar_attack/evaluation/vod.py` | - | Clean / adversarial detections | Official View-of-Delft AP adapter |
+| `../radar_attack/evaluation/` | - | Raw 4D radar points | Auxiliary metrics and point-cloud persistence |
 | `fgsm_attack_radar.py` | FGSM / PGD | 4D radar | Backward-compatible legacy CLI |
 | `radar_point_attack.py` | FGSM / PGD | 4D radar points | Backward-compatible import shim |
 
@@ -56,6 +57,10 @@ conda activate openpcdet
 ```bash
 cd /path/to/OpenPCDet/tools
 ```
+
+3. Place the official View-of-Delft devkit at `~/VoD-evaluation`, or pass
+   its location with `--vod_devkit`. Official VoD clean/adversarial AP
+   evaluation is enabled by default.
 
 ### Point-level FGSM (fixed pillar membership)
 
@@ -170,7 +175,13 @@ python radar_attack/run_attack.py \
 | `--voxel_mode` | str | fixed | Point attack topology: `fixed` or `revoxelize` |
 | `--random_start` | flag | off | Random PGD initialization inside the budget |
 | `--num_samples` | int | None | Number of samples to attack (None = all) |
+| `--seed` | int | 1024 | NumPy, Torch, and CUDA seed for reproducible attacks |
 | `--score_threshold` | float | 0.5 | Confidence threshold for sample-level success |
+| `--vod_eval` | flag | on | Run official VoD AP for clean and adversarial predictions |
+| `--no_vod_eval` | flag | - | Skip official VoD evaluation for a quick smoke test |
+| `--vod_devkit` | str | ~/VoD-evaluation | Official View-of-Delft devkit path |
+| `--vod_label_dir` | str | None | Override label directory; defaults to dataset `training/label_2` |
+| `--vod_score_threshold` | float | -1 | Official evaluator score filter; `-1` keeps all model outputs |
 | `--save_adv` | flag | off | Save adversarial raw point clouds; requires point domain |
 | `--adv_format` | str | npy | Saved point-cloud format: `npy` or headerless `bin` |
 | `--adv_dir` | str | None | Custom save directory; defaults inside experiment output |
@@ -186,14 +197,24 @@ python radar_attack/run_attack.py \
 | `Attack Success Rate` | Number of successfully attacked samples / Number of originally detected samples |
 | `Recall Drop` | Original Recall - Attacked Recall |
 | `Max / Mean \|delta\|` | Raw point-feature perturbation statistics |
+| `VoD Entire-area 3D/BEV AP` | Official VoD per-class AP and mAP over the annotated area |
+| `VoD ROI 3D/BEV AP` | Official VoD AP and mAP in the driving corridor |
+| `VoD AOS` | Official VoD average orientation similarity |
+| `VoD AP Drop` | Clean AP minus adversarial AP, absolute and relative |
 
 **Important**: The Attack Success Rate is calculated only on samples where the model originally detected at least one target with confidence >= 0.5.
+VoD AP is the primary dataset-level metric; Recall and ASR are auxiliary
+attack diagnostics. AP produced with `--num_samples` is a subset diagnostic
+and is not directly comparable with the full 1296-frame validation result.
+The official evaluator cannot recover predictions already removed by
+`MODEL.POST_PROCESSING.SCORE_THRESH`; use a suitably low model threshold for
+final experiments.
 
 ## Recommended Configurations
 
 ### Quick Test
 ```bash
-python radar_attack/run_attack.py --attack_type fgsm --epsilon 0.05 --num_samples 100 --workers 0
+python radar_attack/run_attack.py --attack_type fgsm --epsilon 0.05 --num_samples 100 --workers 0 --no_vod_eval
 ```
 
 ### Standard Evaluation
@@ -234,7 +255,14 @@ BatchNorm statistics are frozen during loss computation.
 Results are saved to:
 ```
 output/<exp_group>/<tag>/<extra_tag>/attack_results.txt
+output/<exp_group>/<tag>/<extra_tag>/attack_results.json
+output/<exp_group>/<tag>/<extra_tag>/vod_predictions/clean/<frame_id>.txt
+output/<exp_group>/<tag>/<extra_tag>/vod_predictions/adversarial/<frame_id>.txt
 ```
+
+`attack_results.json` contains the official clean/adversarial entire-area and
+ROI metrics, per-class values, mAP, absolute AP drop, relative AP drop, and
+the auxiliary attack metrics.
 
 With `--save_adv`, every sample is additionally saved as a raw feature array
 without OpenPCDet's leading batch-index column:
