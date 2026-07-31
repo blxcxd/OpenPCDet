@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 
 from tools.radar_attack.adapters.openpcdet import PointCloudVoxelizer
+from tools.radar_attack.analysis import (
+    StreamingFeatureStatistics,
+    extract_voxelized_features,
+)
 from tools.radar_attack.attacks import (
     AttackOutput,
     build_feature_mask,
@@ -33,6 +37,71 @@ class SumVoxelModel(nn.Module):
 
 
 class RadarAttackComponentTest(unittest.TestCase):
+    def test_extract_voxelized_features_excludes_zero_padding(self):
+        voxels = np.array(
+            [
+                [[1.0, 10.0], [2.0, 20.0], [0.0, 0.0]],
+                [[3.0, 30.0], [0.0, 0.0], [0.0, 0.0]],
+            ]
+        )
+
+        values = extract_voxelized_features(voxels, np.array([2, 1]))
+
+        np.testing.assert_array_equal(
+            values,
+            np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
+        )
+
+    def test_streaming_feature_statistics_handles_batches_and_nonfinite_values(self):
+        statistics = StreamingFeatureStatistics(
+            feature_names=['x', 'rcs'],
+            quantiles=[0.25, 0.5, 0.75],
+            max_quantile_points=10,
+            seed=7,
+        )
+        statistics.update(np.array([[1.0, 10.0], [2.0, 20.0]]))
+        statistics.update(np.array([[3.0, np.inf]]))
+
+        result = statistics.compute()
+
+        self.assertEqual(result['total_points'], 3)
+        self.assertEqual(result['quantile_sample_points'], 3)
+        self.assertEqual(result['quantile_sampling'], 'exact')
+        self.assertEqual(result['features']['x']['finite_count'], 3)
+        self.assertAlmostEqual(result['features']['x']['mean'], 2.0)
+        self.assertAlmostEqual(
+            result['features']['x']['std'],
+            np.sqrt(2.0 / 3.0),
+        )
+        self.assertEqual(result['features']['x']['quantiles']['0.5'], 2.0)
+        self.assertEqual(result['features']['rcs']['finite_count'], 2)
+        self.assertEqual(result['features']['rcs']['nonfinite_count'], 1)
+        self.assertEqual(result['features']['rcs']['mean'], 15.0)
+        self.assertEqual(result['features']['rcs']['unique_count'], 2)
+        self.assertEqual(
+            result['features']['rcs']['unique_values'],
+            [10.0, 20.0],
+        )
+
+    def test_streaming_feature_statistics_caps_quantile_sample(self):
+        statistics = StreamingFeatureStatistics(
+            feature_names=['x'],
+            quantiles=[0.5],
+            max_quantile_points=3,
+            seed=11,
+        )
+        statistics.update(np.arange(10, dtype=np.float64).reshape(-1, 1))
+
+        result = statistics.compute()
+
+        self.assertEqual(result['total_points'], 10)
+        self.assertEqual(result['quantile_sample_points'], 3)
+        self.assertEqual(
+            result['quantile_sampling'],
+            'uniform_without_replacement',
+        )
+        self.assertAlmostEqual(result['features']['x']['mean'], 4.5)
+
     def test_vod_summary_and_attack_drop(self):
         raw = {
             area: {

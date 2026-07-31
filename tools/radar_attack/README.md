@@ -75,6 +75,56 @@ cfgs/kitti_models/pointpillar_radar.yaml
 
 建议为 `--ckpt` 使用绝对路径。
 
+## 统计雷达特征分布
+
+在选择 epsilon 前，先统计进入模型的验证集雷达点特征：
+
+```bash
+python tools/radar_attack/analyze_features.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --batch_size 8 \
+    --workers 4
+```
+
+默认统计实际被硬体素化保留、进入 PointPillars VFE 的有效点，不包含体素零填充，也不包含因范围、每体素点数上限或体素数量上限而被丢弃的点。该命令不加载 checkpoint，也不需要 GPU。
+
+如需审计经过特征编码、相机 FOV 和 `DATA_PROCESSOR` 过滤后仍留在 `points` 数组中的全部点，可以使用：
+
+```bash
+--point_scope processed
+```
+
+OpenPCDet 的预处理点数组和最终硬体素中的点集合不一定相同，因此制定模型攻击预算时应使用默认的 `voxelized` 统计。
+
+默认输出到：
+
+```text
+output/radar_attack/pointpillar_radar/feature_statistics.json
+```
+
+工具为每个特征计算：
+
+- 有限值和非有限值数量；
+- min、max、mean 和总体标准差；
+- 0.1%、1%、5%、25%、50%、75%、95%、99% 和 99.9% 分位数；
+- IQR（Q75-Q25）；
+- robust range（Q99-Q01）。
+- 不超过 32 个取值时的完整离散值集合。
+
+均值、标准差、min 和 max 使用全部点流式精确计算。分位数默认最多对全局均匀抽取的 1,000,000 个点计算；数据点不超过该数量时是精确分位数。可用下面的参数控制：
+
+```bash
+--max_quantile_points 2000000
+--point_scope voxelized
+--quantiles 0.001 0.01 0.05 0.5 0.95 0.99 0.999
+--num_samples 100
+--output output/radar_attack/custom_statistics.json
+```
+
+特征统计提供数值尺度依据，但不能单独证明扰动物理可实现。正式 epsilon 还应结合雷达测量精度、特征单位和攻击威胁模型；尤其不能因为 `xyz`、RCS、Doppler 和时间的数值范围不同，就直接对它们使用同一个预算。
+
+当前 VoD 5 帧数据中的 `time` 是离散 sweep 编号 `-4, -3, -2, -1, 0`，不是连续时间值。对它直接增加连续 FGSM/PGD 扰动只能作为数字特征空间基线，不能直接解释为物理可实现的时间攻击。物理约束实验应暂时排除 time，或另行设计离散的帧删除、帧替换和顺序扰动。
+
 ## 快速验证
 
 先使用少量样本运行点云 FGSM，并跳过耗时的官方 AP：
