@@ -29,6 +29,7 @@ from tools.radar_attack.evaluation.vod import (
     _relative_metric_difference,
     summarize_vod_results,
 )
+from tools.radar_attack.runner import select_sample_indices
 
 
 class SumVoxelModel(nn.Module):
@@ -37,6 +38,15 @@ class SumVoxelModel(nn.Module):
 
 
 class RadarAttackComponentTest(unittest.TestCase):
+    def test_validation_subset_selection_is_reproducible(self):
+        uniform = select_sample_indices(10, 3, 'uniform', seed=7)
+        random_first = select_sample_indices(20, 5, 'random', seed=7)
+        random_second = select_sample_indices(20, 5, 'random', seed=7)
+
+        np.testing.assert_array_equal(uniform, np.array([1, 5, 8]))
+        np.testing.assert_array_equal(random_first, random_second)
+        self.assertEqual(len(np.unique(random_first)), 5)
+
     def test_extract_voxelized_features_excludes_zero_padding(self):
         voxels = np.array(
             [

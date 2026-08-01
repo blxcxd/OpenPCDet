@@ -1,0 +1,117 @@
+version: 1
+name: vod_point_baseline_screen
+
+# Fast 100-frame screening. These runs use internal Recall/ASR metrics to
+# select representative budgets before full validation-set VoD AP evaluation.
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: output/kitti_models/pointpillar_radar/vod5_retrain_seed0/ckpt/checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  voxel_mode: revoxelize
+  pgd_steps: 10
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: fgsm_xyz_e001
+    attack_type: fgsm
+    attack_feature: xyz
+    epsilon_xyz: 0.01
+
+  - name: fgsm_xyz_e002
+    attack_type: fgsm
+    attack_feature: xyz
+    epsilon_xyz: 0.02
+
+  - name: fgsm_xyz_e004
+    attack_type: fgsm
+    attack_feature: xyz
+    epsilon_xyz: 0.04
+
+  - name: pgd_xyz_e001
+    attack_type: pgd
+    attack_feature: xyz
+    epsilon_xyz: 0.01
+    random_start: true
+
+  - name: pgd_xyz_e002
+    attack_type: pgd
+    attack_feature: xyz
+    epsilon_xyz: 0.02
+    random_start: true
+
+  - name: pgd_xyz_e004
+    attack_type: pgd
+    attack_feature: xyz
+    epsilon_xyz: 0.04
+    random_start: true
+
+  - name: fgsm_rcs_e01
+    attack_type: fgsm
+    attack_feature: rcs
+    epsilon_rcs: 0.1
+
+  - name: fgsm_rcs_e03
+    attack_type: fgsm
+    attack_feature: rcs
+    epsilon_rcs: 0.3
+
+  - name: fgsm_rcs_e06
+    attack_type: fgsm
+    attack_feature: rcs
+    epsilon_rcs: 0.6
+
+  - name: pgd_rcs_e01
+    attack_type: pgd
+    attack_feature: rcs
+    epsilon_rcs: 0.1
+    random_start: true
+
+  - name: pgd_rcs_e03
+    attack_type: pgd
+    attack_feature: rcs
+    epsilon_rcs: 0.3
+    random_start: true
+
+  - name: pgd_rcs_e06
+    attack_type: pgd
+    attack_feature: rcs
+    epsilon_rcs: 0.6
+    random_start: true
+
+  - name: fgsm_doppler_e002
+    attack_type: fgsm
+    attack_feature: doppler
+    epsilon_doppler: 0.02
+
+  - name: fgsm_doppler_e005
+    attack_type: fgsm
+    attack_feature: doppler
+    epsilon_doppler: 0.05
+
+  - name: fgsm_doppler_e01
+    attack_type: fgsm
+    attack_feature: doppler
+    epsilon_doppler: 0.1
+
+  - name: pgd_doppler_e002
+    attack_type: pgd
+    attack_feature: doppler
+    epsilon_doppler: 0.02
+    random_start: true
+
+  - name: pgd_doppler_e005
+    attack_type: pgd
+    attack_feature: doppler
+    epsilon_doppler: 0.05
+    random_start: true
+
+  - name: pgd_doppler_e01
+    attack_type: pgd
+    attack_feature: doppler
+    epsilon_doppler: 0.1
+    random_start: true

@@ -7,11 +7,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import datetime
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 import tqdm
+from torch.utils.data import DataLoader, Sampler
 
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
@@ -32,6 +34,56 @@ from radar_attack.evaluation import (
     prepare_prediction_directory,
     resolve_vod_label_dir,
 )
+
+
+class OrderedIndexSampler(Sampler):
+    """Yield a reproducible, explicitly ordered validation subset."""
+
+    def __init__(self, indices):
+        self.indices = [int(index) for index in indices]
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
+def select_sample_indices(dataset_size, num_samples, strategy, seed):
+    if dataset_size <= 0:
+        raise ValueError('dataset_size must be positive')
+    if num_samples is None or num_samples >= dataset_size:
+        return np.arange(dataset_size, dtype=np.int64)
+    if num_samples <= 0:
+        raise ValueError('num_samples must be positive')
+    if strategy == 'first':
+        return np.arange(num_samples, dtype=np.int64)
+    if strategy == 'uniform':
+        return np.floor(
+            (np.arange(num_samples, dtype=np.float64) + 0.5)
+            * dataset_size
+            / num_samples
+        ).astype(np.int64)
+    if strategy == 'random':
+        indices = np.random.default_rng(seed).choice(
+            dataset_size, size=num_samples, replace=False
+        )
+        return np.sort(indices.astype(np.int64, copy=False))
+    raise ValueError(f'unknown sample strategy: {strategy}')
+
+
+def build_subset_dataloader(dataset, args, indices):
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        pin_memory=True,
+        num_workers=args.workers,
+        sampler=OrderedIndexSampler(indices),
+        collate_fn=dataset.collate_batch,
+        drop_last=False,
+        timeout=0,
+        worker_init_fn=partial(common_utils.worker_init_fn, seed=args.seed),
+    )
 
 
 def parse_config():
@@ -69,6 +121,9 @@ def parse_config():
                         choices=['fixed', 'revoxelize'],
                         help='point topology: fixed pillars or per-step revoxelization')
     parser.add_argument('--num_samples', type=int, default=None, help='number of samples to attack')
+    parser.add_argument('--sample_strategy', choices=['first', 'uniform', 'random'],
+                        default='first',
+                        help='validation subset selection when num_samples is set')
     parser.add_argument('--save_adv', action='store_true', default=False, help='save adversarial samples')
     parser.add_argument('--adv_dir', type=str, default=None,
                         help='directory for adversarial raw points (default: experiment output/adversarial_points)')
@@ -109,6 +164,9 @@ def parse_config():
         parser.error('--save_adv requires --attack_domain point')
     if args.vod_eval and args.launcher != 'none':
         parser.error('official VoD evaluation currently requires --launcher none')
+    if (args.num_samples is not None and args.sample_strategy != 'first'
+            and args.launcher != 'none'):
+        parser.error('uniform/random sample selection requires --launcher none')
     for name in ['epsilon_xyz', 'epsilon_rcs', 'epsilon_doppler', 'epsilon_time']:
         value = getattr(args, name)
         if value is not None and value < 0:
@@ -198,6 +256,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'step_size': args.step_size,
                     'random_start': args.random_start,
                     'voxel_mode': args.voxel_mode,
+                    'sample_strategy': args.sample_strategy,
                 },
             )
             logger.info('Adversarial raw points will be saved to %s', adversarial_dir)
@@ -391,6 +450,21 @@ def main():
         batch_size=args.batch_size,
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
+    selected_indices = select_sample_indices(
+        len(test_set), args.num_samples, args.sample_strategy, args.seed
+    )
+    if args.num_samples is not None:
+        test_loader = build_subset_dataloader(test_set, args, selected_indices)
+        args.sample_indices = selected_indices.tolist()
+        logger.info(
+            'Selected %d validation frames with strategy=%s and seed=%d',
+            len(selected_indices),
+            args.sample_strategy,
+            args.seed,
+        )
+        logger.info('Validation sample indices: %s', args.sample_indices)
+    else:
+        args.sample_indices = None
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
     model.load_params_from_file(filename=args.ckpt, logger=logger)

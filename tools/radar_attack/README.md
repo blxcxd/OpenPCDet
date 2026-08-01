@@ -332,6 +332,62 @@ adversarial_points/              # 使用 --save_adv 时生成
 
 内部指标包括 clean/attacked Recall、样本级攻击成功率、目标级攻击成功率、Recall drop，以及点云攻击的最大和平均绝对扰动。论文实验应优先报告完整验证集上的 VoD 官方 AP，而不是只使用内部攻击成功率。
 
+## 批量基线实验
+
+`run_experiments.py` 可以从 YAML 顺序运行一组攻击，自动分配互不冲突的输出目录，并汇总结果。仓库提供了 100 帧 epsilon 筛选配置：
+
+```text
+tools/radar_attack/configs/vod_point_baseline_screen.yaml
+```
+
+先检查将要执行的命令，不启动模型：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_point_baseline_screen.yaml \
+    --dry-run
+```
+
+只运行一个实验：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_point_baseline_screen.yaml \
+    --only fgsm_xyz_e001
+```
+
+确认后运行整个筛选 campaign：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_point_baseline_screen.yaml \
+    --keep-going
+```
+
+每个实验输出到：
+
+```text
+output/kitti_models/pointpillar_radar/
+└── vod_point_baseline_screen/
+    ├── <experiment_name>/
+    │   └── attack_results.json
+    ├── experiment_state.json
+    ├── summary.csv
+    └── summary.md
+```
+
+运行器以有效且参数匹配的 `attack_results.json` 作为完成标志。命令中断后重新执行会跳过已有匹配结果；YAML 参数变化时旧结果会标记为 `stale` 并自动重跑，`--force` 会无条件重新运行选中的实验。只重新生成汇总表可使用：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_point_baseline_screen.yaml \
+    --summary-only
+```
+
+汇总表中的 `epsilon_default` 是命令行 `--epsilon` 的回退值；实际提供了 `epsilon_xyz`、`epsilon_rcs`、`epsilon_doppler` 或 `epsilon_time` 时，应以相应的分组预算列为准。
+
+筛选配置使用 `num_samples: 100`、`sample_strategy: uniform` 和 `no_vod_eval: true`，在整个验证集上均匀选取固定的 100 帧，用于快速比较 Recall/ASR。也可以使用 `sample_strategy: random` 配合 `seed` 得到可复现的随机子集；`first` 则保留旧的前 N 帧行为。筛选出代表性 epsilon 后，必须去掉样本限制，在完整 1296 帧验证集上启用 VoD 官方 AP，才能形成论文表格。
+
 ## 主要参数
 
 | 参数 | 默认值 | 说明 |
@@ -360,10 +416,10 @@ python tools/radar_attack/run_attack.py --help
 在仓库根目录运行：
 
 ```bash
-python -m unittest tools.radar_attack.tests.test_components
+python -m unittest discover -s tools/radar_attack/tests
 ```
 
-测试覆盖点云输出、扰动投影、特征选择、体素 Doppler 通道、点云保存、VoD 结果汇总和预测目录清理。正式修改攻击或体素化逻辑后，还应使用真实 checkpoint 做小样本 GPU 验证。
+测试覆盖点云输出、扰动投影、特征选择、体素 Doppler 通道、点云保存、VoD 结果汇总、预测目录清理，以及批量命令和结果汇总。正式修改攻击或体素化逻辑后，还应使用真实 checkpoint 做小样本 GPU 验证。
 
 ## 当前限制
 

@@ -8,6 +8,7 @@ venv/
 *.idea/
 *.so
 *.yaml
+!tools/radar_attack/configs/vod_point_baseline_screen.yaml
 *.sh
 *.pth
 *.pkl
