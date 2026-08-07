@@ -1,0 +1,62 @@
+version: 1
+name: vod_iadv_rcs_screen
+
+# Direct-transfer screen for I-ADV-RCS against the existing point-wise RCS-PGD
+# baseline. Both attacks use 10 iterations, alpha=0.2*epsilon_rcs, the same
+# OpenPCDet training loss, and the same uniformly sampled validation frames.
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: output/kitti_models/pointpillar_radar/vod5_retrain_seed0/ckpt/checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  attack_feature: rcs
+  voxel_mode: fixed
+  point_scope: gt_boxes
+  target_classes: [Car]
+  pgd_steps: 10
+  iadv_steps: 10
+  iadv_scope: gt_boxes
+  # Legacy direct-transfer result: attacked Car points share one neighbour pool.
+  # New object-isolated experiments use vod_iadv_rcs_object_fidelity.yaml.
+  iadv_neighbor_scope: attack_union
+  iadv_attack_voxel_size: 0.1
+  iadv_mu: 1.0
+  iadv_lambda: 1000.0
+  iadv_d_max: 75.0
+  iadv_k_neighbors: 16
+  iadv_min_neighbors: 3
+  iadv_gradient_norm: l1
+  object_iou_thresholds: [Car=0.5]
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: pgd_rcs_e01
+    attack_type: pgd
+    epsilon_rcs: 0.1
+    random_start: true
+
+  - name: iadv_rcs_e01
+    attack_type: iadv
+    epsilon_rcs: 0.1
+
+  - name: pgd_rcs_e03
+    attack_type: pgd
+    epsilon_rcs: 0.3
+    random_start: true
+
+  - name: iadv_rcs_e03
+    attack_type: iadv
+    epsilon_rcs: 0.3
+
+  - name: pgd_rcs_e06
+    attack_type: pgd
+    epsilon_rcs: 0.6
+    random_start: true
+
+  - name: iadv_rcs_e06
+    attack_type: iadv
+    epsilon_rcs: 0.6

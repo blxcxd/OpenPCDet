@@ -1,11 +1,10 @@
 """FGSM/PGD-style attacks on raw 4D-radar points."""
 
-from typing import Dict, Optional, Sequence
+from typing import Callable, Dict, Optional, Sequence
 
 import torch
-import torch.nn as nn
 
-from .base import AttackOutput
+from .base import AttackOutput, restore_attack_modes, set_attack_mode
 
 
 def _feature_group(name: str) -> str:
@@ -57,6 +56,11 @@ def build_budget(
         raise ValueError(
             f'feature group "{attack_feature}" is absent from {list(feature_names)}'
         )
+    budget = torch.where(
+        budget > 0,
+        torch.nextafter(budget, torch.zeros_like(budget)),
+        budget,
+    )
     return budget
 
 
@@ -80,11 +84,12 @@ def project_points(
         (original[:, 1:4] >= spatial_min)
         & (original[:, 1:4] < spatial_max)
     ).all(dim=1)
+    xyz_budget_active = (budget[:, 1:4] > 0).expand_as(original[:, 1:4])
     bounded_xyz = torch.maximum(
         torch.minimum(projected[:, 1:4], spatial_max - margin), spatial_min
     )
     projected[:, 1:4] = torch.where(
-        original_in_range.unsqueeze(1),
+        original_in_range.unsqueeze(1) & xyz_budget_active,
         bounded_xyz,
         original[:, 1:4],
     )
@@ -98,29 +103,26 @@ def project_points(
             cell_min,
         )
         projected[:, 1:4] = torch.where(
-            original_in_range.unsqueeze(1),
+            original_in_range.unsqueeze(1) & xyz_budget_active,
             fixed_xyz,
             original[:, 1:4],
         )
+    for _ in range(8):
+        exceeds_budget = (projected - original).abs() > budget
+        if not exceeds_budget.any():
+            break
+        projected = torch.where(
+            exceeds_budget,
+            torch.nextafter(projected, original),
+            projected,
+        )
+    if ((projected - original).abs() > budget).any():
+        raise RuntimeError('could not represent an adversarial point within budget')
     return projected
 
 
-def _set_attack_mode(model: nn.Module) -> Dict[nn.Module, bool]:
-    states = {module: module.training for module in model.modules()}
-    model.train()
-    for module in model.modules():
-        if isinstance(module, nn.modules.batchnorm._BatchNorm):
-            module.eval()
-    return states
-
-
-def _restore_modes(states: Dict[nn.Module, bool]) -> None:
-    for module, training in states.items():
-        module.training = training
-
-
 def point_cloud_attack(
-    model: nn.Module,
+    model: torch.nn.Module,
     batch_dict: Dict,
     voxelizer,
     feature_names: Sequence[str],
@@ -132,6 +134,9 @@ def point_cloud_attack(
     step_size: Optional[float] = None,
     random_start: bool = False,
     voxel_mode: str = 'fixed',
+    point_mask: Optional[torch.Tensor] = None,
+    loss_fn: Optional[Callable[[torch.nn.Module], torch.Tensor]] = None,
+    loss_stats: Optional[Dict[str, float]] = None,
 ) -> AttackOutput:
     """Generate an untargeted adversarial raw radar point cloud."""
     if attack_type not in {'fgsm', 'pgd'}:
@@ -152,6 +157,12 @@ def point_cloud_attack(
     budget = build_budget(
         original, feature_names, attack_feature, epsilon, epsilon_overrides
     )
+    if point_mask is not None:
+        if point_mask.shape != (original.shape[0],):
+            raise ValueError('point_mask must have shape [N]')
+        budget = budget * point_mask.to(
+            device=original.device, dtype=original.dtype
+        ).unsqueeze(1)
     steps = 1 if attack_type == 'fgsm' else pgd_steps
     step = budget if attack_type == 'fgsm' else budget * (2.0 / steps)
     if step_size is not None:
@@ -181,7 +192,7 @@ def point_cloud_attack(
             voxel_mode,
         )
 
-    states = _set_attack_mode(model)
+    states = set_attack_mode(model)
     try:
         for _ in range(steps):
             adversarial = adversarial.detach().requires_grad_(True)
@@ -196,7 +207,11 @@ def point_cloud_attack(
             attack_batch.update(voxel_data)
 
             ret_dict, _, _ = model(attack_batch)
-            loss = ret_dict['loss'].mean()
+            loss = (
+                ret_dict['loss'].mean()
+                if loss_fn is None
+                else loss_fn(model).mean()
+            )
             gradient = torch.autograd.grad(loss, adversarial)[0]
             if not torch.isfinite(gradient).all():
                 raise RuntimeError('non-finite point gradient during radar attack')
@@ -210,7 +225,7 @@ def point_cloud_attack(
                 voxel_mode,
             )
     finally:
-        _restore_modes(states)
+        restore_attack_modes(states)
         model.zero_grad(set_to_none=True)
 
     adversarial = adversarial.detach()
@@ -221,14 +236,18 @@ def point_cloud_attack(
     )
     voxel_data = voxelizer.materialize(adversarial, final_topology)
 
-    attacked_columns = budget.squeeze(0) > 0
-    delta = (adversarial - original).abs()[:, attacked_columns]
+    attacked_values = budget > 0
+    if attacked_values.shape[0] == 1:
+        attacked_values = attacked_values.expand_as(original)
+    delta = (adversarial - original).abs()[attacked_values]
     stats = {
         'max_abs_perturbation': delta.max().item() if delta.numel() else 0.0,
         'mean_abs_perturbation': delta.mean().item() if delta.numel() else 0.0,
         'sum_abs_perturbation': delta.sum().item() if delta.numel() else 0.0,
         'perturbation_values': float(delta.numel()),
     }
+    if loss_stats is not None:
+        stats.update({key: float(value) for key, value in loss_stats.items()})
     return AttackOutput(
         adv_points=adversarial,
         model_inputs=voxel_data,

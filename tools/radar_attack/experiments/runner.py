@@ -32,11 +32,37 @@ VALUE_OPTIONS = (
     'epsilon_doppler',
     'epsilon_time',
     'voxel_mode',
+    'point_scope',
+    'target_classes',
+    'point_box_margin',
+    'point_target_selection',
+    'attack_loss',
+    'hybrid_localization_weight',
+    'hybrid_localization_topk',
+    'object_loss_iou_threshold',
+    'object_loss_candidate_margin',
+    'object_loss_candidate_topk',
+    'object_loss_temperature',
+    'iadv_steps',
+    'iadv_scope',
+    'iadv_neighbor_scope',
+    'iadv_attack_voxel_size',
+    'iadv_mu',
+    'iadv_lambda',
+    'iadv_d_max',
+    'iadv_k_neighbors',
+    'iadv_min_neighbors',
+    'iadv_neighbor_radius',
+    'iadv_gradient_norm',
+    'iadv_box_margin',
+    'iadv_rcs_min',
+    'iadv_rcs_max',
+    'object_iou_thresholds',
+    'object_score_threshold',
     'num_samples',
     'sample_strategy',
     'adv_dir',
     'adv_format',
-    'score_threshold',
     'vod_devkit',
     'vod_label_dir',
     'vod_score_threshold',
@@ -62,14 +88,55 @@ SUMMARY_COLUMNS = (
     'epsilon_doppler',
     'epsilon_time',
     'pgd_steps',
+    'iadv_steps',
+    'iadv_scope',
+    'iadv_neighbor_scope',
+    'iadv_attack_voxel_size',
+    'iadv_gradient_norm',
+    'iadv_k_neighbors',
     'voxel_mode',
+    'point_scope',
+    'point_target_selection',
+    'attack_loss',
+    'target_classes',
+    'hybrid_localization_weight',
+    'hybrid_localization_topk',
     'seed',
     'total_samples',
     'original_recall',
     'attacked_recall',
     'recall_drop',
-    'attack_success_rate_sample',
+    'object_target_objects',
+    'eligible_clean_objects',
+    'object_failure_asr',
+    'pure_hiding_asr',
+    'misclassification_rate',
+    'localization_failure_rate',
+    'still_correct_rate',
+    'still_correct_count',
+    'pure_hiding_count',
+    'misclassification_count',
+    'localization_failure_count',
+    'pure_hiding_by_class',
+    'mean_max_iou_drop',
+    'iou_decreased_fraction',
+    'mean_match_score_drop',
+    'score_decreased_fraction',
+    'mean_object_evidence_drop',
+    'evidence_decreased_fraction',
+    'mean_prediction_center_shift',
+    'mean_center_error_increase',
     'max_abs_perturbation',
+    'object_evidence_targets',
+    'object_evidence_mean_candidates_per_target',
+    'iadv_valid_targets',
+    'iadv_mean_points_per_target',
+    'iadv_pca_fallback_rate',
+    'iadv_singleton_group_ratio',
+    'iadv_mean_groups_per_target',
+    'iadv_mean_points_per_group',
+    'iadv_cross_target_neighbors',
+    'iadv_nonfinite_gradient_steps',
     'entire_clean_3d_map',
     'entire_adversarial_3d_map',
     'entire_3d_map_drop',
@@ -316,6 +383,13 @@ def result_matches_experiment(
             actual = attack.get('set_cfgs')
         else:
             actual = attack.get(key)
+        if (
+            key == 'iadv_neighbor_scope'
+            and expected == 'attack_union'
+            and actual is None
+        ):
+            # Results produced before object isolation used attack_union.
+            actual = 'attack_union'
         if actual != expected:
             return False
     return attack.get('extra_tag') == experiment.extra_tag
@@ -339,6 +413,20 @@ def result_to_row(
     attack = payload.get('attack', {}) if payload else experiment.parameters
     metrics = payload.get('metrics', {}) if payload else {}
     vod = metrics.get('vod_official', {})
+    diagnostics = metrics.get('attack_diagnostics', {})
+    endpoint = metrics.get('object_endpoint_metrics', {})
+    outcomes = metrics.get('object_outcomes', {})
+    outcome_counts = outcomes.get('counts', {})
+    outcome_rates = outcomes.get('rates', {})
+    by_class = outcomes.get('by_class', {})
+    pure_hiding_by_class = {
+        class_name: {
+            'count': class_result.get('counts', {}).get('pure_hiding'),
+            'eligible': class_result.get('eligible_clean_objects'),
+            'rate': class_result.get('rates', {}).get('pure_hiding_asr'),
+        }
+        for class_name, class_result in by_class.items()
+    }
 
     row = {
         'name': experiment.name,
@@ -352,14 +440,101 @@ def result_to_row(
         'epsilon_doppler': attack.get('epsilon_doppler'),
         'epsilon_time': attack.get('epsilon_time'),
         'pgd_steps': attack.get('pgd_steps'),
+        'iadv_steps': attack.get('iadv_steps'),
+        'iadv_scope': attack.get('iadv_scope'),
+        'iadv_neighbor_scope': attack.get(
+            'iadv_neighbor_scope',
+            'attack_union' if attack.get('attack_type') == 'iadv' else None,
+        ),
+        'iadv_attack_voxel_size': attack.get('iadv_attack_voxel_size'),
+        'iadv_gradient_norm': attack.get('iadv_gradient_norm'),
+        'iadv_k_neighbors': attack.get('iadv_k_neighbors'),
         'voxel_mode': attack.get('voxel_mode'),
+        'point_scope': attack.get('point_scope'),
+        'point_target_selection': attack.get('point_target_selection'),
+        'attack_loss': attack.get('attack_loss'),
+        'target_classes': ' '.join(
+            outcomes.get('target_classes') or attack.get('target_classes') or []
+        ) or None,
+        'hybrid_localization_weight': attack.get(
+            'hybrid_localization_weight'
+        ),
+        'hybrid_localization_topk': attack.get(
+            'hybrid_localization_topk'
+        ),
         'seed': attack.get('seed'),
         'total_samples': metrics.get('total_samples'),
         'original_recall': metrics.get('original_recall'),
         'attacked_recall': metrics.get('attacked_recall'),
         'recall_drop': metrics.get('recall_drop'),
-        'attack_success_rate_sample': metrics.get('attack_success_rate_sample'),
+        'object_target_objects': outcomes.get('target_objects'),
+        'eligible_clean_objects': outcomes.get('eligible_clean_objects'),
+        'object_failure_asr': outcome_rates.get(
+            'object_failure_asr', metrics.get('object_attack_success_rate')
+        ),
+        'pure_hiding_asr': outcome_rates.get('pure_hiding_asr'),
+        'misclassification_rate': outcome_rates.get('misclassification_rate'),
+        'localization_failure_rate': outcome_rates.get('localization_failure_rate'),
+        'still_correct_rate': outcome_rates.get('still_correct_rate'),
+        'still_correct_count': outcome_counts.get('still_correct'),
+        'pure_hiding_count': outcome_counts.get('pure_hiding'),
+        'misclassification_count': outcome_counts.get('misclassification'),
+        'localization_failure_count': outcome_counts.get('localization_failure'),
+        'pure_hiding_by_class': (
+            json.dumps(pure_hiding_by_class, sort_keys=True)
+            if pure_hiding_by_class else None
+        ),
+        'mean_max_iou_drop': _nested(endpoint, 'max_iou_drop', 'mean'),
+        'iou_decreased_fraction': _nested(
+            endpoint, 'max_iou_drop', 'positive_fraction'
+        ),
+        'mean_match_score_drop': _nested(
+            endpoint, 'match_score_drop', 'mean'
+        ),
+        'score_decreased_fraction': _nested(
+            endpoint, 'match_score_drop', 'positive_fraction'
+        ),
+        'mean_object_evidence_drop': _nested(
+            endpoint, 'object_evidence_drop', 'mean'
+        ),
+        'evidence_decreased_fraction': _nested(
+            endpoint, 'object_evidence_drop', 'positive_fraction'
+        ),
+        'mean_prediction_center_shift': _nested(
+            endpoint, 'prediction_center_shift', 'mean'
+        ),
+        'mean_center_error_increase': _nested(
+            endpoint, 'center_error_increase', 'mean'
+        ),
         'max_abs_perturbation': metrics.get('max_abs_perturbation'),
+        'object_evidence_targets': diagnostics.get(
+            'object_evidence_targets'
+        ),
+        'object_evidence_mean_candidates_per_target': diagnostics.get(
+            'object_evidence_mean_candidates_per_target'
+        ),
+        'iadv_valid_targets': diagnostics.get('iadv_valid_targets'),
+        'iadv_mean_points_per_target': diagnostics.get(
+            'iadv_mean_points_per_target'
+        ),
+        'iadv_pca_fallback_rate': diagnostics.get(
+            'iadv_pca_fallback_rate'
+        ),
+        'iadv_singleton_group_ratio': diagnostics.get(
+            'iadv_singleton_group_ratio'
+        ),
+        'iadv_mean_groups_per_target': diagnostics.get(
+            'iadv_mean_groups_per_target'
+        ),
+        'iadv_mean_points_per_group': diagnostics.get(
+            'iadv_mean_points_per_group'
+        ),
+        'iadv_cross_target_neighbors': diagnostics.get(
+            'iadv_cross_target_neighbors'
+        ),
+        'iadv_nonfinite_gradient_steps': diagnostics.get(
+            'iadv_nonfinite_gradient_steps'
+        ),
         'entire_clean_3d_map': _nested(vod, 'clean', 'entire_area', '3d', 'mAP'),
         'entire_adversarial_3d_map': _nested(
             vod, 'adversarial', 'entire_area', '3d', 'mAP'

@@ -9,6 +9,13 @@ venv/
 *.so
 *.yaml
 !tools/radar_attack/configs/vod_point_baseline_screen.yaml
+!tools/radar_attack/configs/vod_iadv_rcs_screen.yaml
+!tools/radar_attack/configs/vod_iadv_rcs_object_fidelity.yaml
+!tools/radar_attack/configs/vod_iadv_rcs_radar_screen.yaml
+!tools/radar_attack/configs/vod_iadv_rcs_full_ap.yaml
+!tools/radar_attack/configs/vod_object_loss_ablation.yaml
+!tools/radar_attack/configs/vod_object_endpoint_ablation.yaml
+!tools/radar_attack/configs/vod_object_hybrid_ablation.yaml
 *.sh
 *.pth
 *.pkl

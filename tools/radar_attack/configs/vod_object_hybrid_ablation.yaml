@@ -1,0 +1,65 @@
+version: 1
+name: vod_object_hybrid_ablation
+
+# Three-way loss ablation with identical targets, masks, budgets and fixed
+# topology: detector training loss vs classification evidence vs the new
+# classification + target-specific localization objective.
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: output/kitti_models/pointpillar_radar/vod5_retrain_seed0/ckpt/checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  attack_type: pgd
+  pgd_steps: 10
+  voxel_mode: fixed
+  point_scope: gt_boxes
+  target_classes: [Car]
+  point_target_selection: clean_detected
+  object_loss_iou_threshold: 0.5
+  object_iou_thresholds: [Car=0.5]
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: rcs_training_e16
+    attack_feature: rcs
+    attack_loss: training
+    epsilon_rcs: 1.6
+    step_size: 0.32
+
+  - name: rcs_evidence_e16
+    attack_feature: rcs
+    attack_loss: object_evidence
+    epsilon_rcs: 1.6
+    step_size: 0.32
+
+  - name: rcs_hybrid_e16
+    attack_feature: rcs
+    attack_loss: object_hybrid
+    epsilon_rcs: 1.6
+    step_size: 0.32
+    hybrid_localization_weight: 1.0
+    hybrid_localization_topk: 32
+
+  - name: xyz_training_e002
+    attack_feature: xyz
+    attack_loss: training
+    epsilon_xyz: 0.02
+    step_size: 0.004
+
+  - name: xyz_evidence_e002
+    attack_feature: xyz
+    attack_loss: object_evidence
+    epsilon_xyz: 0.02
+    step_size: 0.004
+
+  - name: xyz_hybrid_e002
+    attack_feature: xyz
+    attack_loss: object_hybrid
+    epsilon_xyz: 0.02
+    step_size: 0.004
+    hybrid_localization_weight: 1.0
+    hybrid_localization_topk: 32

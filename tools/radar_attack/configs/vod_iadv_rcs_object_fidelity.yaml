@@ -1,0 +1,43 @@
+version: 1
+name: vod_iadv_rcs_object_fidelity
+
+# Corrected object-isolated I-ADV-RCS reproduction. The earlier
+# vod_iadv_rcs_screen campaign remains the traceable attack-union baseline.
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: output/kitti_models/pointpillar_radar/vod5_retrain_seed0/ckpt/checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  attack_type: iadv
+  attack_feature: rcs
+  voxel_mode: fixed
+  iadv_steps: 10
+  iadv_scope: gt_boxes
+  iadv_neighbor_scope: object
+  target_classes: [Car]
+  iadv_attack_voxel_size: 0.1
+  iadv_mu: 1.0
+  iadv_lambda: 1000.0
+  iadv_d_max: 75.0
+  iadv_k_neighbors: 16
+  iadv_min_neighbors: 3
+  iadv_gradient_norm: l1
+  object_iou_thresholds: [Car=0.5]
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: iadv_object_v01_e01
+    epsilon_rcs: 0.1
+    step_size: 0.02
+
+  - name: iadv_object_v01_e03
+    epsilon_rcs: 0.3
+    step_size: 0.06
+
+  - name: iadv_object_v01_e06
+    epsilon_rcs: 0.6
+    step_size: 0.12

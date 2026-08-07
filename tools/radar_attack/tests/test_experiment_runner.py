@@ -45,6 +45,10 @@ class ExperimentRunnerTest(unittest.TestCase):
                 'ckpt': '/tmp/model.pth',
                 'attack_type': 'pgd',
                 'epsilon_xyz': 0.02,
+                'target_classes': ['Car', 'Pedestrian', 'Cyclist'],
+                'object_iou_thresholds': [
+                    'Car=0.5', 'Pedestrian=0.25', 'Cyclist=0.25'
+                ],
                 'random_start': True,
                 'no_vod_eval': True,
                 'set': ['MODEL.POST_PROCESSING.SCORE_THRESH', '0.0'],
@@ -62,6 +66,11 @@ class ExperimentRunnerTest(unittest.TestCase):
         self.assertEqual(command[:2], ['/env/python', '/repo/run_attack.py'])
         self.assertIn('--random_start', command)
         self.assertIn('--no_vod_eval', command)
+        target_index = command.index('--target_classes')
+        self.assertEqual(
+            command[target_index + 1:target_index + 4],
+            ['Car', 'Pedestrian', 'Cyclist'],
+        )
         self.assertEqual(
             command[-3:],
             ['--set', 'MODEL.POST_PROCESSING.SCORE_THRESH', '0.0'],
@@ -88,6 +97,35 @@ class ExperimentRunnerTest(unittest.TestCase):
                     'original_recall': 0.8,
                     'attacked_recall': 0.6,
                     'recall_drop': 0.2,
+                    'object_outcomes': {
+                        'target_classes': ['Car', 'Pedestrian'],
+                        'target_objects': 30,
+                        'eligible_clean_objects': 20,
+                        'counts': {
+                            'still_correct': 12,
+                            'pure_hiding': 5,
+                            'misclassification': 1,
+                            'localization_failure': 2,
+                        },
+                        'rates': {
+                            'object_failure_asr': 0.4,
+                            'pure_hiding_asr': 0.25,
+                            'misclassification_rate': 0.05,
+                            'localization_failure_rate': 0.1,
+                            'still_correct_rate': 0.6,
+                        },
+                        'by_class': {
+                            'Car': {
+                                'eligible_clean_objects': 10,
+                                'counts': {'pure_hiding': 3},
+                                'rates': {'pure_hiding_asr': 0.3},
+                            },
+                        },
+                    },
+                    'attack_diagnostics': {
+                        'iadv_singleton_group_ratio': 0.75,
+                        'iadv_cross_target_neighbors': 0.0,
+                    },
                     'vod_official': {
                         'clean': {
                             'entire_area': {'3d': {'mAP': 45.4}},
@@ -122,6 +160,12 @@ class ExperimentRunnerTest(unittest.TestCase):
             self.assertEqual(row['epsilon_xyz'], 0.01)
             self.assertEqual(row['entire_3d_map_drop'], 15.4)
             self.assertEqual(row['roi_adversarial_3d_map'], 44.0)
+            self.assertEqual(row['iadv_singleton_group_ratio'], 0.75)
+            self.assertEqual(row['iadv_cross_target_neighbors'], 0.0)
+            self.assertEqual(row['target_classes'], 'Car Pedestrian')
+            self.assertEqual(row['pure_hiding_asr'], 0.25)
+            self.assertEqual(row['pure_hiding_count'], 5)
+            self.assertIn('"Car"', row['pure_hiding_by_class'])
 
             self.assertTrue(result_matches_experiment(experiment))
             changed_experiment = Experiment(

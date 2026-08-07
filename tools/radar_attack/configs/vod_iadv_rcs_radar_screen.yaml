@@ -1,0 +1,84 @@
+version: 1
+name: vod_iadv_rcs_radar_screen
+
+# Radar RCS budget and attack-group scale screen. epsilon values correspond to
+# approximately 5%, 10%, and 20% of the measured VoD RCS IQR (15.59).
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: output/kitti_models/pointpillar_radar/vod5_retrain_seed0/ckpt/checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  attack_feature: rcs
+  voxel_mode: fixed
+  point_scope: gt_boxes
+  target_classes: [Car]
+  pgd_steps: 10
+  iadv_steps: 10
+  iadv_scope: gt_boxes
+  iadv_neighbor_scope: object
+  iadv_attack_voxel_size: 0.1
+  iadv_mu: 1.0
+  iadv_lambda: 1000.0
+  iadv_d_max: 75.0
+  iadv_k_neighbors: 16
+  iadv_min_neighbors: 3
+  iadv_gradient_norm: l1
+  object_iou_thresholds: [Car=0.5]
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: pgd_object_e08
+    attack_type: pgd
+    epsilon_rcs: 0.8
+    step_size: 0.16
+    random_start: true
+
+  - name: iadv_object_v01_e08
+    attack_type: iadv
+    epsilon_rcs: 0.8
+    step_size: 0.16
+
+  - name: pgd_object_e16
+    attack_type: pgd
+    epsilon_rcs: 1.6
+    step_size: 0.32
+    random_start: true
+
+  # This run is also the voxel_size=0.1 reference for the scale sweep below.
+  - name: iadv_object_v01_e16
+    attack_type: iadv
+    epsilon_rcs: 1.6
+    step_size: 0.32
+
+  - name: pgd_object_e31
+    attack_type: pgd
+    epsilon_rcs: 3.1
+    step_size: 0.62
+    random_start: true
+
+  - name: iadv_object_v01_e31
+    attack_type: iadv
+    epsilon_rcs: 3.1
+    step_size: 0.62
+
+  - name: iadv_object_v03_e16
+    attack_type: iadv
+    epsilon_rcs: 1.6
+    step_size: 0.32
+    iadv_attack_voxel_size: 0.3
+
+  - name: iadv_object_v05_e16
+    attack_type: iadv
+    epsilon_rcs: 1.6
+    step_size: 0.32
+    iadv_attack_voxel_size: 0.5
+
+  - name: iadv_object_v10_e16
+    attack_type: iadv
+    epsilon_rcs: 1.6
+    step_size: 0.32
+    iadv_attack_voxel_size: 1.0

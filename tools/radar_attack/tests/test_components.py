@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -14,14 +15,23 @@ from tools.radar_attack.analysis import (
 )
 from tools.radar_attack.attacks import (
     AttackOutput,
+    assign_points_to_oriented_boxes,
+    build_iadv_attack_mask,
+    build_iadv_groups,
+    build_iadv_object_ids,
     build_feature_mask,
+    compute_reflectivity_features,
+    extremum_fusion,
+    iadv_rcs_attack,
     point_cloud_attack,
+    points_in_oriented_boxes,
     voxel_attack,
 )
 from tools.radar_attack.attacks.gradient import project_points
 from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    compare_target_object_endpoints,
     prepare_prediction_directory,
 )
 from tools.radar_attack.evaluation.vod import (
@@ -34,10 +44,25 @@ from tools.radar_attack.runner import select_sample_indices
 
 class SumVoxelModel(nn.Module):
     def forward(self, batch_dict):
+        self.last_voxels = batch_dict['voxels']
         return {'loss': batch_dict['voxels'].sum()}, {}, {}
 
 
 class RadarAttackComponentTest(unittest.TestCase):
+    @staticmethod
+    def _axis_aligned_iou(boxes_a, boxes_b):
+        if boxes_a.shape[0] == 0 or boxes_b.shape[0] == 0:
+            return boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))
+        minimum_a = boxes_a[:, None, :3] - boxes_a[:, None, 3:6] / 2
+        maximum_a = boxes_a[:, None, :3] + boxes_a[:, None, 3:6] / 2
+        minimum_b = boxes_b[None, :, :3] - boxes_b[None, :, 3:6] / 2
+        maximum_b = boxes_b[None, :, :3] + boxes_b[None, :, 3:6] / 2
+        overlap = (torch.minimum(maximum_a, maximum_b) - torch.maximum(minimum_a, minimum_b)).clamp_min(0)
+        intersection = overlap.prod(dim=-1)
+        volume_a = boxes_a[:, 3:6].prod(dim=-1)[:, None]
+        volume_b = boxes_b[:, 3:6].prod(dim=-1)[None, :]
+        return intersection / (volume_a + volume_b - intersection).clamp_min(1e-8)
+
     def test_validation_subset_selection_is_reproducible(self):
         uniform = select_sample_indices(10, 3, 'uniform', seed=7)
         random_first = select_sample_indices(20, 5, 'random', seed=7)
@@ -175,6 +200,28 @@ class RadarAttackComponentTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(projected[:, 1:4], original[:, 1:4]))
 
+    def test_rcs_only_projection_does_not_clamp_xyz_at_pillar_edge(self):
+        original = torch.tensor(
+            [[0.0, 0.99999, 0.5, 0.5, 2.0]], dtype=torch.float32
+        )
+        candidate = original.clone()
+        candidate[:, 4] += 0.2
+        budget = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.2]])
+
+        projected = project_points(
+            candidate,
+            original,
+            budget,
+            point_cloud_range=[0, 0, 0, 2, 2, 2],
+            voxel_size=[1, 1, 1],
+            voxel_mode='fixed',
+        )
+
+        self.assertTrue(torch.equal(projected[:, 1:4], original[:, 1:4]))
+        self.assertLessEqual(
+            (projected[:, 4] - original[:, 4]).abs().item(), 0.2
+        )
+
     def test_voxel_doppler_attack_selects_both_velocity_channels(self):
         voxels = torch.tensor(
             [[[1.0, 2.0, 0.0, 4.0, -2.0, -3.0, 0.01]]]
@@ -236,8 +283,338 @@ class RadarAttackComponentTest(unittest.TestCase):
             np.isclose(output.stats['max_abs_perturbation'], 0.1)
         )
 
+        masked_output = point_cloud_attack(
+            model=SumVoxelModel(),
+            batch_dict={'points': points, 'batch_size': 1},
+            voxelizer=voxelizer,
+            feature_names=[
+                'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+            ],
+            attack_type='fgsm',
+            attack_feature='rcs',
+            epsilon=0.2,
+            point_mask=torch.tensor([True, False]),
+        )
+        self.assertAlmostEqual(
+            masked_output.adv_points[0, 4].item(), 2.2, places=6
+        )
+        self.assertEqual(masked_output.adv_points[1, 4].item(), 3.0)
+
+    def test_point_fgsm_accepts_a_custom_attack_objective(self):
+        points = torch.tensor(
+            [[0.0, 0.2, 0.3, 0.4, 2.0, 0.5, 0.6, 0.01]]
+        )
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, 0, 0, 4, 4, 4],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=4,
+            max_voxels=10,
+            batch_size=1,
+        )
+
+        output = point_cloud_attack(
+            model=SumVoxelModel(),
+            batch_dict={'points': points, 'batch_size': 1},
+            voxelizer=voxelizer,
+            feature_names=[
+                'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+            ],
+            attack_type='fgsm',
+            attack_feature='rcs',
+            epsilon=0.2,
+            loss_fn=lambda model: -model.last_voxels.sum(),
+        )
+
+        self.assertAlmostEqual(output.adv_points[0, 4].item(), 1.8, places=6)
+
+    def test_oriented_box_mask_and_target_class_filter(self):
+        xyz = torch.tensor(
+            [
+                [1.0, 1.8, 1.0],
+                [1.8, 1.0, 1.0],
+                [4.0, 4.0, 4.0],
+            ]
+        )
+        boxes = torch.tensor(
+            [[1.0, 1.0, 1.0, 2.0, 1.0, 2.0, torch.pi / 2]]
+        )
+        self.assertEqual(
+            points_in_oriented_boxes(xyz, boxes).tolist(),
+            [True, False, False],
+        )
+
+        points = torch.cat(
+            (torch.zeros((3, 1)), xyz, torch.ones((3, 4))), dim=1
+        )
+        gt_boxes = torch.tensor(
+            [[
+                [1.0, 1.0, 1.0, 2.0, 1.0, 2.0, torch.pi / 2, 1.0],
+                [4.0, 4.0, 4.0, 2.0, 2.0, 2.0, 0.0, 2.0],
+            ]]
+        )
+        mask = build_iadv_attack_mask(
+            points,
+            {'batch_size': 1, 'gt_boxes': gt_boxes},
+            scope='gt_boxes',
+            target_class_id=1,
+        )
+        self.assertEqual(mask.tolist(), [True, False, False])
+
+    def test_points_are_assigned_to_individual_boxes(self):
+        points = torch.tensor(
+            [
+                [-0.8, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [8.0, 0.0, 0.0],
+            ]
+        )
+        boxes = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+                [2.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+            ]
+        )
+
+        assignments = assign_points_to_oriented_boxes(points, boxes)
+
+        self.assertEqual(assignments.tolist(), [0, 1, -1])
+
+    def test_overlapping_box_assignment_uses_normalized_center_distance(self):
+        points = torch.tensor([[0.85, 0.0, 0.0]])
+        boxes = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0],
+                [1.0, 0.0, 0.0, 1.0, 2.0, 2.0, 0.0],
+            ]
+        )
+
+        assignments = assign_points_to_oriented_boxes(points, boxes)
+
+        self.assertEqual(assignments.item(), 1)
+
+    def test_object_ids_are_batch_local_and_class_filtered(self):
+        points = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 3.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+        gt_boxes = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 1.0],
+                    [3.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 2.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+            ]
+        )
+
+        object_ids = build_iadv_object_ids(
+            points,
+            {'batch_size': 2, 'gt_boxes': gt_boxes},
+            scope='gt_boxes',
+            target_class_id=1,
+        )
+
+        self.assertEqual(object_ids.tolist(), [0, -1, 0])
+
+        multi_class_ids = build_iadv_object_ids(
+            points,
+            {'batch_size': 2, 'gt_boxes': gt_boxes},
+            scope='gt_boxes',
+            target_class_ids=[1, 2],
+        )
+        self.assertEqual(multi_class_ids.tolist(), [0, 1, 0])
+
+    def test_object_endpoints_are_mutually_exclusive_across_classes(self):
+        gt_boxes = torch.tensor([
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0],
+            [3.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0],
+            [6.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 3.0],
+            [9.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0],
+        ])
+        clean = {
+            'pred_boxes': gt_boxes[:, :7].clone(),
+            'pred_scores': torch.full((4,), 0.9),
+            'pred_labels': gt_boxes[:, -1].long(),
+        }
+        adversarial_boxes = torch.stack((
+            gt_boxes[0, :7],
+            gt_boxes[1, :7],
+            gt_boxes[2, :7].clone(),
+        ))
+        adversarial_boxes[2, 0] += 0.8
+        adversarial = {
+            'pred_boxes': adversarial_boxes,
+            'pred_scores': torch.full((3,), 0.8),
+            'pred_labels': torch.tensor([1, 1, 3]),
+        }
+
+        with patch(
+            'tools.radar_attack.evaluation.object_endpoints.'
+            'iou3d_nms_utils.boxes_iou3d_gpu',
+            side_effect=self._axis_aligned_iou,
+        ):
+            target_count, records = compare_target_object_endpoints(
+                clean,
+                adversarial,
+                gt_boxes,
+                target_classes={1: 'Car', 2: 'Pedestrian', 3: 'Cyclist'},
+                iou_thresholds={1: 0.5, 2: 0.25, 3: 0.25},
+                frame_id='000001',
+                object_score_threshold=0.1,
+                class_names={1: 'Car', 2: 'Pedestrian', 3: 'Cyclist'},
+            )
+
+        self.assertEqual(target_count, 4)
+        self.assertEqual(
+            [record['outcome'] for record in records],
+            ['still_correct', 'misclassification', 'localization_failure', 'pure_hiding'],
+        )
+
+    def test_object_neighbours_do_not_cross_targets_and_sparse_pca_falls_back(self):
+        points = torch.tensor(
+            [
+                [0.0, 1.00, 0.0, 0.0, 1.0],
+                [0.0, 1.01, 0.0, 0.0, 1.0],
+                [0.0, 1.02, 0.0, 0.0, 1.0],
+                [0.0, 1.03, 0.0, 0.0, 1.0],
+            ]
+        )
+        attack_mask = torch.ones(4, dtype=torch.bool)
+        object_ids = torch.tensor([0, 0, 1, 1])
+
+        _, object_stats = compute_reflectivity_features(
+            points,
+            attack_mask,
+            k_neighbors=3,
+            min_neighbors=3,
+            neighbor_scope='object',
+            object_ids=object_ids,
+        )
+        _, union_stats = compute_reflectivity_features(
+            points,
+            attack_mask,
+            k_neighbors=3,
+            min_neighbors=3,
+            neighbor_scope='attack_union',
+            object_ids=object_ids,
+        )
+
+        self.assertEqual(object_stats['reflectivity_fallback_points'], 4.0)
+        self.assertEqual(
+            object_stats['reflectivity_cross_target_neighbors'], 0.0
+        )
+        self.assertGreater(
+            union_stats['reflectivity_cross_target_neighbors'], 0.0
+        )
+
+    def test_object_id_is_part_of_gradient_fusion_group_key(self):
+        points = torch.tensor(
+            [
+                [0.0, 1.01, 1.01, 1.01, 1.0],
+                [0.0, 1.02, 1.02, 1.02, 1.0],
+                [0.0, 1.03, 1.03, 1.03, 1.0],
+                [0.0, 1.04, 1.04, 1.04, 1.0],
+            ]
+        )
+        attack_mask = torch.ones(4, dtype=torch.bool)
+        object_ids = torch.tensor([0, 0, 1, 1])
+        group_ids, num_groups = build_iadv_groups(
+            points,
+            attack_mask,
+            voxel_size=0.1,
+            object_ids=object_ids,
+        )
+
+        directions = extremum_fusion(
+            torch.tensor([2.0, 1.0, -3.0, -1.0]), group_ids, num_groups
+        )
+
+        self.assertEqual(num_groups, 2)
+        self.assertEqual(directions.tolist(), [1.0, 1.0, -1.0, -1.0])
+
+    def test_reflectivity_feature_uses_distance_fallback_when_pca_is_sparse(self):
+        points = torch.tensor(
+            [
+                [0.0, 3.0, 4.0, 0.0, 1.0],
+                [0.0, 6.0, 8.0, 0.0, 1.0],
+            ]
+        )
+        features, stats = compute_reflectivity_features(
+            points,
+            torch.tensor([True, True]),
+            k_neighbors=3,
+            min_neighbors=3,
+            d_max=20.0,
+        )
+
+        expected = torch.sin(
+            torch.tensor([5.0, 10.0]) / 20.0 * torch.pi / 2
+        )
+        self.assertTrue(torch.allclose(features, expected))
+        self.assertEqual(stats['reflectivity_fallback_points'], 2.0)
+
+    def test_extremum_fusion_uses_largest_signed_extreme(self):
+        gradient = torch.tensor([2.0, -3.0, 1.0, -0.5, 0.0])
+        group_ids = torch.tensor([0, 0, 1, 1, 2])
+
+        directions = extremum_fusion(gradient, group_ids, num_groups=3)
+
+        self.assertEqual(
+            directions.tolist(), [-1.0, -1.0, 1.0, 1.0, 0.0]
+        )
+
+    def test_iadv_returns_budgeted_rcs_only_adversarial_points(self):
+        points = torch.tensor(
+            [
+                [0.0, 1.01, 1.01, 1.01, 2.0, 0.5, 0.6, 0.01],
+                [0.0, 1.04, 1.01, 1.01, 3.0, 0.7, 0.8, 0.02],
+                [0.0, 1.01, 1.04, 1.01, 4.0, 0.9, 1.0, 0.03],
+            ]
+        )
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, 0, 0, 4, 4, 4],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=8,
+            max_voxels=10,
+            batch_size=1,
+        )
+
+        output = iadv_rcs_attack(
+            model=SumVoxelModel(),
+            batch_dict={'points': points, 'batch_size': 1},
+            voxelizer=voxelizer,
+            feature_names=[
+                'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+            ],
+            epsilon_rcs=0.5,
+            steps=2,
+            attack_voxel_size=0.1,
+            gradient_enhancement=1.0,
+            k_neighbors=3,
+            min_neighbors=3,
+            scope='scene',
+            neighbor_scope='scene',
+        )
+
+        self.assertTrue(torch.equal(output.adv_points[:, :4], points[:, :4]))
+        self.assertTrue(
+            torch.allclose(output.adv_points[:, 4], points[:, 4] + 0.2)
+        )
+        self.assertTrue(torch.equal(output.adv_points[:, 5:], points[:, 5:]))
+        self.assertLessEqual(output.stats['max_abs_perturbation'], 0.5)
+        self.assertEqual(output.stats['iadv_attacked_points'], 3.0)
+        self.assertEqual(output.stats['iadv_groups'], 1.0)
+        self.assertEqual(output.stats['iadv_cross_target_neighbors'], 0.0)
+        self.assertEqual(output.stats['iadv_nonfinite_gradient_steps'], 0.0)
+
     def test_metrics_support_batches_and_weight_perturbations(self):
-        metrics = DetectionAttackMetrics(score_threshold=0.5)
+        metrics = DetectionAttackMetrics()
         clean = [
             {'pred_scores': torch.tensor([0.8])},
             {'pred_scores': torch.tensor([0.3])},
@@ -257,15 +634,62 @@ class RadarAttackComponentTest(unittest.TestCase):
                 'max_abs_perturbation': 0.2,
                 'sum_abs_perturbation': 0.6,
                 'perturbation_values': 4,
+                'iadv_attacked_points': 8,
+                'iadv_valid_targets': 2,
+                'iadv_groups': 5,
+                'iadv_singleton_groups': 3,
+                'reflectivity_fallback_points': 2,
+                'iadv_cross_target_neighbors': 0,
+                'object_evidence_targets': 2,
+                'object_evidence_candidate_anchors': 20,
             }
+        )
+        metrics.update_object_endpoints(
+            3,
+            [
+                {
+                    'frame_id': '000001',
+                    'class_name': 'Car',
+                    'outcome': 'pure_hiding',
+                    'max_iou_drop': 0.2,
+                    'match_score_drop': 0.1,
+                    'object_evidence_drop': 0.3,
+                    'prediction_center_shift': 0.05,
+                    'center_error_increase': 0.02,
+                    'prediction_size_l1_shift': 0.01,
+                    'prediction_yaw_shift': 0.005,
+                    'clean_iou_margin': 0.3,
+                    'adversarial_iou_margin': 0.1,
+                }
+            ]
         )
 
         result = metrics.compute()
         self.assertEqual(result['total_samples'], 2)
         self.assertEqual(result['original_recall'], 0.75)
         self.assertEqual(result['attacked_recall'], 0.25)
-        self.assertEqual(result['attack_success_rate_sample'], 1.0)
+        self.assertNotIn('attack_success_rate_sample', result)
         self.assertEqual(result['mean_abs_perturbation'], 0.15)
+        self.assertEqual(result['object_outcomes']['target_objects'], 3)
+        self.assertEqual(result['object_outcomes']['eligible_clean_objects'], 1)
+        self.assertAlmostEqual(result['object_failure_asr'], 1.0)
+        self.assertAlmostEqual(result['pure_hiding_asr'], 1.0)
+        diagnostics = result['attack_diagnostics']
+        self.assertEqual(diagnostics['iadv_valid_targets'], 2)
+        self.assertEqual(diagnostics['iadv_mean_points_per_target'], 4)
+        self.assertEqual(diagnostics['iadv_mean_points_per_group'], 1.6)
+        self.assertEqual(diagnostics['iadv_singleton_group_ratio'], 0.6)
+        self.assertEqual(diagnostics['iadv_pca_fallback_rate'], 0.25)
+        self.assertEqual(diagnostics['object_evidence_targets'], 2)
+        self.assertEqual(
+            diagnostics['object_evidence_mean_candidates_per_target'], 10
+        )
+        endpoint = result['object_endpoint_metrics']
+        self.assertEqual(endpoint['evaluated_clean_objects'], 1)
+        self.assertEqual(endpoint['max_iou_drop']['mean'], 0.2)
+        self.assertEqual(
+            endpoint['object_evidence_drop']['positive_fraction'], 1.0
+        )
 
     def test_writer_saves_feature_only_arrays_and_manifest(self):
         clean = torch.tensor(
