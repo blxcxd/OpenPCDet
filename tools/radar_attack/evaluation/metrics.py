@@ -20,6 +20,11 @@ ENDPOINT_METRIC_FIELDS = (
     'prediction_yaw_shift',
     'clean_iou_margin',
     'adversarial_iou_margin',
+    'num_attacked_points',
+    'pillar_reassignment_rate',
+    'mean_xyz_l2_displacement',
+    'max_xyz_l2_displacement',
+    'active_current_sweep_point_count',
 )
 
 
@@ -37,6 +42,8 @@ def _endpoint_summary(records: Sequence[Dict]) -> Dict:
             'median': float(np.median(values)) if values.size else None,
             'q10': float(np.quantile(values, 0.1)) if values.size else None,
             'q90': float(np.quantile(values, 0.9)) if values.size else None,
+            'min': float(values.min()) if values.size else None,
+            'max': float(values.max()) if values.size else None,
             'positive_fraction': float(np.mean(values > 0)) if values.size else None,
         }
     return summary
@@ -65,6 +72,7 @@ class DetectionAttackMetrics:
     perturbation_values: float = 0.0
     object_targets: int = 0
     diagnostic_sums: Dict[str, float] = field(default_factory=dict)
+    diagnostic_maxima: Dict[str, float] = field(default_factory=dict)
     diagnostic_updates: int = 0
     object_endpoint_records: list[Dict] = field(default_factory=list)
 
@@ -93,8 +101,22 @@ class DetectionAttackMetrics:
             'max_abs_perturbation', 'mean_abs_perturbation',
             'sum_abs_perturbation', 'perturbation_values',
         }
+        maximum_keys = {
+            'measurement_max_abs_delta_range',
+            'measurement_max_abs_delta_azimuth_rad',
+            'measurement_max_abs_delta_elevation_rad',
+            'measurement_max_xyz_l2',
+            'point_max_xyz_l2',
+            'temporal_max_alignment_error_m',
+            'temporal_shared_delta_max_abs',
+            'temporal_parameter_delta_max_abs',
+        }
         for key, value in stats.items():
-            if key not in core_keys:
+            if key in maximum_keys:
+                self.diagnostic_maxima[key] = max(
+                    self.diagnostic_maxima.get(key, 0.0), float(value)
+                )
+            elif key not in core_keys:
                 self.diagnostic_sums[key] = self.diagnostic_sums.get(key, 0.0) + float(value)
         self.diagnostic_updates += 1
 
@@ -159,6 +181,7 @@ class DetectionAttackMetrics:
                 key: value / max(self.diagnostic_updates, 1)
                 for key, value in self.diagnostic_sums.items()
             }
+            diagnostics.update(self.diagnostic_maxima)
             sums = self.diagnostic_sums
             attacked_points = sums.get('iadv_attacked_points', 0.0)
             valid_targets = sums.get('iadv_valid_targets', 0.0)
@@ -176,13 +199,87 @@ class DetectionAttackMetrics:
                 'iadv_cross_target_neighbors', 'iadv_nonfinite_gradient_steps',
                 'reflectivity_cross_target_neighbors', 'object_evidence_targets',
                 'object_evidence_candidate_anchors', 'object_hybrid_localization_anchors',
+                'object_iou_s_targets', 'object_iou_s_candidate_anchors',
+                'measurement_batches', 'measurement_batches_with_attack_points',
+                'measurement_target_points', 'measurement_current_target_points',
+                'measurement_historical_target_points',
+                'measurement_clean_active_target_points',
+                'measurement_clean_active_current_target_points',
+                'measurement_clean_active_historical_target_points',
+                'measurement_zero_range_target_points',
+                'measurement_modified_current_points',
+                'measurement_historical_modification_count',
+                'measurement_non_target_modification_count',
+                'measurement_non_geometry_modification_count',
+                'measurement_out_of_range_backtracks',
+                'measurement_out_of_range_rejections',
+                'measurement_nonfinite_gradient_steps',
+                'measurement_zero_gradient_steps',
+                'measurement_xyz_l2_sum',
+                'temporal_frames',
+                'temporal_shared_groups',
+                'temporal_active_shared_groups',
+                'temporal_parameter_groups',
+                'temporal_active_parameter_groups',
+                'temporal_current_label_targets',
+                'temporal_matched_current_targets',
+                'temporal_target_points',
+                'temporal_current_target_points',
+                'temporal_historical_target_points',
+                'temporal_attack_target_points',
+                'temporal_attack_current_points',
+                'temporal_attack_historical_points',
+                'temporal_attack_clean_active_points',
+                'temporal_out_of_range_backtrack_points',
+                'temporal_out_of_range_backtrack_groups',
+                'temporal_out_of_range_rejected_groups',
+                'point_attack_mask_points',
+                'point_modified_points',
+                'point_non_mask_modification_count',
+                'point_non_selected_feature_modification_count',
+                'point_xyz_l2_sum',
+                'point_xyz_l2_count',
+                'current_sweep_target_points',
+                'current_sweep_time0_target_points',
+                'current_sweep_history_target_points',
+                'current_sweep_clean_active_target_points',
             ):
                 if total_key in sums:
                     diagnostics[total_key] = sums[total_key]
+            measurement_active_key = (
+                'measurement_clean_active_target_points'
+                if 'measurement_clean_active_target_points' in sums
+                else 'measurement_clean_active_current_target_points'
+            )
+            if measurement_active_key in sums:
+                diagnostics['measurement_mean_xyz_l2'] = (
+                    sums.get('measurement_xyz_l2_sum', 0.0)
+                    / max(sums[measurement_active_key], 1.0)
+                )
+                for suffix in (
+                    'r0_10', 'r10_20', 'r20_30', 'r30_50', 'r50_inf'
+                ):
+                    count_key = f'measurement_xyz_l2_count_{suffix}'
+                    sum_key = f'measurement_xyz_l2_sum_{suffix}'
+                    count = sums.get(count_key, 0.0)
+                    diagnostics[count_key] = count
+                    diagnostics[
+                        f'measurement_mean_xyz_l2_{suffix}'
+                    ] = sums.get(sum_key, 0.0) / max(count, 1.0)
+            if 'point_xyz_l2_count' in sums:
+                diagnostics['point_mean_xyz_l2'] = (
+                    sums.get('point_xyz_l2_sum', 0.0)
+                    / max(sums['point_xyz_l2_count'], 1.0)
+                )
             if 'object_evidence_targets' in sums:
                 diagnostics['object_evidence_mean_candidates_per_target'] = (
                     sums.get('object_evidence_candidate_anchors', 0.0)
                     / max(sums['object_evidence_targets'], 1.0)
+                )
+            if 'object_iou_s_targets' in sums:
+                diagnostics['object_iou_s_mean_candidates_per_target'] = (
+                    sums.get('object_iou_s_candidate_anchors', 0.0)
+                    / max(sums['object_iou_s_targets'], 1.0)
                 )
             results['attack_diagnostics'] = diagnostics
         return results

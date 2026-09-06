@@ -24,6 +24,7 @@ VALUE_OPTIONS = (
     'epsilon',
     'attack_domain',
     'attack_feature',
+    'attack_space',
     'attack_type',
     'pgd_steps',
     'step_size',
@@ -31,6 +32,16 @@ VALUE_OPTIONS = (
     'epsilon_rcs',
     'epsilon_doppler',
     'epsilon_time',
+    'epsilon_range',
+    'epsilon_azimuth_deg',
+    'epsilon_elevation_deg',
+    'step_size_range',
+    'step_size_azimuth_deg',
+    'step_size_elevation_deg',
+    'temporal_mode',
+    'temporal_dataset_root',
+    'temporal_cache_dir',
+    'temporal_max_residual_m',
     'voxel_mode',
     'point_scope',
     'target_classes',
@@ -39,6 +50,10 @@ VALUE_OPTIONS = (
     'attack_loss',
     'hybrid_localization_weight',
     'hybrid_localization_topk',
+    'iou_s_candidate_topk',
+    'iou_s_score_weight',
+    'iou_s_iou_weight',
+    'iou_s_log_epsilon',
     'object_loss_iou_threshold',
     'object_loss_candidate_margin',
     'object_loss_candidate_topk',
@@ -72,6 +87,7 @@ VALUE_OPTIONS = (
 )
 FLAG_OPTIONS = (
     'random_start',
+    'current_sweep_only',
     'save_adv',
     'vod_eval',
     'no_vod_eval',
@@ -82,11 +98,16 @@ SUMMARY_COLUMNS = (
     'attack_domain',
     'attack_type',
     'attack_feature',
+    'attack_space',
+    'temporal_mode',
     'epsilon_default',
     'epsilon_xyz',
     'epsilon_rcs',
     'epsilon_doppler',
     'epsilon_time',
+    'epsilon_range',
+    'epsilon_azimuth_deg',
+    'epsilon_elevation_deg',
     'pgd_steps',
     'iadv_steps',
     'iadv_scope',
@@ -97,10 +118,15 @@ SUMMARY_COLUMNS = (
     'voxel_mode',
     'point_scope',
     'point_target_selection',
+    'current_sweep_only',
     'attack_loss',
     'target_classes',
     'hybrid_localization_weight',
     'hybrid_localization_topk',
+    'iou_s_candidate_topk',
+    'iou_s_score_weight',
+    'iou_s_iou_weight',
+    'iou_s_log_epsilon',
     'seed',
     'total_samples',
     'original_recall',
@@ -119,6 +145,7 @@ SUMMARY_COLUMNS = (
     'localization_failure_count',
     'pure_hiding_by_class',
     'mean_max_iou_drop',
+    'median_max_iou_drop',
     'iou_decreased_fraction',
     'mean_match_score_drop',
     'score_decreased_fraction',
@@ -127,8 +154,28 @@ SUMMARY_COLUMNS = (
     'mean_prediction_center_shift',
     'mean_center_error_increase',
     'max_abs_perturbation',
+    'mean_attacked_points',
+    'mean_pillar_reassignment_rate',
+    'mean_target_xyz_displacement',
+    'max_target_xyz_displacement',
+    'reassignment_iou_drop_spearman',
+    'active_points_iou_drop_spearman',
+    'measurement_active_current_points',
+    'measurement_active_points',
+    'temporal_shared_groups',
+    'temporal_active_shared_groups',
+    'temporal_historical_target_points',
+    'measurement_max_delta_range',
+    'measurement_max_delta_azimuth_rad',
+    'measurement_max_delta_elevation_rad',
+    'measurement_max_xyz_l2',
+    'measurement_mean_xyz_l2',
+    'measurement_historical_modifications',
+    'measurement_non_target_modifications',
     'object_evidence_targets',
     'object_evidence_mean_candidates_per_target',
+    'object_iou_s_targets',
+    'object_iou_s_mean_candidates_per_target',
     'iadv_valid_targets',
     'iadv_mean_points_per_target',
     'iadv_pca_fallback_rate',
@@ -247,7 +294,10 @@ def _normalize_parameters(parameters: Dict, repo_root: Path, tools_dir: Path) ->
     normalized['cfg_file'] = _normalize_cfg_file(
         normalized['cfg_file'], repo_root, tools_dir
     )
-    for path_key in ('ckpt', 'vod_devkit', 'vod_label_dir', 'adv_dir'):
+    for path_key in (
+        'ckpt', 'vod_devkit', 'vod_label_dir', 'adv_dir',
+        'temporal_dataset_root', 'temporal_cache_dir',
+    ):
         if normalized.get(path_key) is not None:
             normalized[path_key] = _resolve_repo_path(
                 normalized[path_key], repo_root
@@ -434,11 +484,16 @@ def result_to_row(
         'attack_domain': attack.get('attack_domain'),
         'attack_type': attack.get('attack_type'),
         'attack_feature': attack.get('attack_feature'),
+        'attack_space': attack.get('attack_space', 'feature'),
+        'temporal_mode': attack.get('temporal_mode', 'none'),
         'epsilon_default': attack.get('epsilon'),
         'epsilon_xyz': attack.get('epsilon_xyz'),
         'epsilon_rcs': attack.get('epsilon_rcs'),
         'epsilon_doppler': attack.get('epsilon_doppler'),
         'epsilon_time': attack.get('epsilon_time'),
+        'epsilon_range': attack.get('epsilon_range'),
+        'epsilon_azimuth_deg': attack.get('epsilon_azimuth_deg'),
+        'epsilon_elevation_deg': attack.get('epsilon_elevation_deg'),
         'pgd_steps': attack.get('pgd_steps'),
         'iadv_steps': attack.get('iadv_steps'),
         'iadv_scope': attack.get('iadv_scope'),
@@ -452,6 +507,7 @@ def result_to_row(
         'voxel_mode': attack.get('voxel_mode'),
         'point_scope': attack.get('point_scope'),
         'point_target_selection': attack.get('point_target_selection'),
+        'current_sweep_only': attack.get('current_sweep_only', False),
         'attack_loss': attack.get('attack_loss'),
         'target_classes': ' '.join(
             outcomes.get('target_classes') or attack.get('target_classes') or []
@@ -462,6 +518,10 @@ def result_to_row(
         'hybrid_localization_topk': attack.get(
             'hybrid_localization_topk'
         ),
+        'iou_s_candidate_topk': attack.get('iou_s_candidate_topk'),
+        'iou_s_score_weight': attack.get('iou_s_score_weight'),
+        'iou_s_iou_weight': attack.get('iou_s_iou_weight'),
+        'iou_s_log_epsilon': attack.get('iou_s_log_epsilon'),
         'seed': attack.get('seed'),
         'total_samples': metrics.get('total_samples'),
         'original_recall': metrics.get('original_recall'),
@@ -485,6 +545,7 @@ def result_to_row(
             if pure_hiding_by_class else None
         ),
         'mean_max_iou_drop': _nested(endpoint, 'max_iou_drop', 'mean'),
+        'median_max_iou_drop': _nested(endpoint, 'max_iou_drop', 'median'),
         'iou_decreased_fraction': _nested(
             endpoint, 'max_iou_drop', 'positive_fraction'
         ),
@@ -507,11 +568,71 @@ def result_to_row(
             endpoint, 'center_error_increase', 'mean'
         ),
         'max_abs_perturbation': metrics.get('max_abs_perturbation'),
+        'mean_attacked_points': _nested(
+            endpoint, 'num_attacked_points', 'mean'
+        ),
+        'mean_pillar_reassignment_rate': _nested(
+            endpoint, 'pillar_reassignment_rate', 'mean'
+        ),
+        'mean_target_xyz_displacement': _nested(
+            endpoint, 'mean_xyz_l2_displacement', 'mean'
+        ),
+        'max_target_xyz_displacement': _nested(
+            endpoint, 'max_xyz_l2_displacement', 'max'
+        ),
+        'reassignment_iou_drop_spearman': _nested(
+            metrics, 'target_correlations',
+            'pillar_reassignment_rate_vs_iou_drop', 'rho'
+        ),
+        'active_points_iou_drop_spearman': _nested(
+            metrics, 'target_correlations',
+            'active_current_sweep_point_count_vs_iou_drop', 'rho'
+        ),
+        'measurement_active_current_points': diagnostics.get(
+            'measurement_clean_active_current_target_points'
+        ),
+        'measurement_active_points': diagnostics.get(
+            'measurement_clean_active_target_points'
+        ),
+        'temporal_shared_groups': diagnostics.get(
+            'temporal_shared_groups'
+        ),
+        'temporal_active_shared_groups': diagnostics.get(
+            'temporal_active_shared_groups'
+        ),
+        'temporal_historical_target_points': diagnostics.get(
+            'temporal_historical_target_points'
+        ),
+        'measurement_max_delta_range': diagnostics.get(
+            'measurement_max_abs_delta_range'
+        ),
+        'measurement_max_delta_azimuth_rad': diagnostics.get(
+            'measurement_max_abs_delta_azimuth_rad'
+        ),
+        'measurement_max_delta_elevation_rad': diagnostics.get(
+            'measurement_max_abs_delta_elevation_rad'
+        ),
+        'measurement_max_xyz_l2': diagnostics.get(
+            'measurement_max_xyz_l2'
+        ),
+        'measurement_mean_xyz_l2': diagnostics.get(
+            'measurement_mean_xyz_l2'
+        ),
+        'measurement_historical_modifications': diagnostics.get(
+            'measurement_historical_modification_count'
+        ),
+        'measurement_non_target_modifications': diagnostics.get(
+            'measurement_non_target_modification_count'
+        ),
         'object_evidence_targets': diagnostics.get(
             'object_evidence_targets'
         ),
         'object_evidence_mean_candidates_per_target': diagnostics.get(
             'object_evidence_mean_candidates_per_target'
+        ),
+        'object_iou_s_targets': diagnostics.get('object_iou_s_targets'),
+        'object_iou_s_mean_candidates_per_target': diagnostics.get(
+            'object_iou_s_mean_candidates_per_target'
         ),
         'iadv_valid_targets': diagnostics.get('iadv_valid_targets'),
         'iadv_mean_points_per_target': diagnostics.get(
@@ -579,6 +700,47 @@ def write_summaries(campaign: Campaign, state: Optional[Dict] = None) -> Sequenc
         for row in rows:
             values = [_format_cell(row[column]).replace('|', '\\|') for column in SUMMARY_COLUMNS]
             markdown_file.write('| ' + ' | '.join(values) + ' |\n')
+
+    comparison_columns = (
+        'Attack', 'Targets', 'Mean attacked points', 'Object ASR',
+        'Mean IoU drop', 'Median IoU drop', 'Mean score drop',
+        'Mean evidence drop', 'Mean XYZ displacement',
+        'Max XYZ displacement', 'Mean pillar reassignment rate',
+    )
+    comparison_rows = []
+    for row in rows:
+        comparison_rows.append({
+            'Attack': row['name'],
+            'Targets': row['eligible_clean_objects'],
+            'Mean attacked points': row['mean_attacked_points'],
+            'Object ASR': row['object_failure_asr'],
+            'Mean IoU drop': row['mean_max_iou_drop'],
+            'Median IoU drop': row['median_max_iou_drop'],
+            'Mean score drop': row['mean_match_score_drop'],
+            'Mean evidence drop': row['mean_object_evidence_drop'],
+            'Mean XYZ displacement': row['mean_target_xyz_displacement'],
+            'Max XYZ displacement': row['max_target_xyz_displacement'],
+            'Mean pillar reassignment rate': row[
+                'mean_pillar_reassignment_rate'
+            ],
+        })
+    comparison_csv = campaign.output_dir / 'comparison_summary.csv'
+    comparison_md = campaign.output_dir / 'comparison_summary.md'
+    with comparison_csv.open('w', newline='', encoding='utf-8') as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=comparison_columns)
+        writer.writeheader()
+        writer.writerows(comparison_rows)
+    with comparison_md.open('w', encoding='utf-8') as output_file:
+        output_file.write('| ' + ' | '.join(comparison_columns) + ' |\n')
+        output_file.write(
+            '| ' + ' | '.join('---' for _ in comparison_columns) + ' |\n'
+        )
+        for row in comparison_rows:
+            output_file.write(
+                '| ' + ' | '.join(
+                    _format_cell(row[column]) for column in comparison_columns
+                ) + ' |\n'
+            )
     return rows
 
 

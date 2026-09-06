@@ -44,12 +44,17 @@ class ExperimentRunnerTest(unittest.TestCase):
                 'cfg_file': 'cfgs/model.yaml',
                 'ckpt': '/tmp/model.pth',
                 'attack_type': 'pgd',
+                'attack_space': 'radar_measurement',
                 'epsilon_xyz': 0.02,
+                'epsilon_range': 0.1,
+                'epsilon_azimuth_deg': 0.2,
+                'epsilon_elevation_deg': 0.1,
                 'target_classes': ['Car', 'Pedestrian', 'Cyclist'],
                 'object_iou_thresholds': [
                     'Car=0.5', 'Pedestrian=0.25', 'Cyclist=0.25'
                 ],
                 'random_start': True,
+                'current_sweep_only': True,
                 'no_vod_eval': True,
                 'set': ['MODEL.POST_PROCESSING.SCORE_THRESH', '0.0'],
             },
@@ -65,7 +70,12 @@ class ExperimentRunnerTest(unittest.TestCase):
 
         self.assertEqual(command[:2], ['/env/python', '/repo/run_attack.py'])
         self.assertIn('--random_start', command)
+        self.assertEqual(command.count('--current_sweep_only'), 1)
         self.assertIn('--no_vod_eval', command)
+        self.assertIn('--attack_space', command)
+        self.assertEqual(
+            command[command.index('--epsilon_range') + 1], '0.1'
+        )
         target_index = command.index('--target_classes')
         self.assertEqual(
             command[target_index + 1:target_index + 4],
@@ -86,10 +96,14 @@ class ExperimentRunnerTest(unittest.TestCase):
                 'attack': {
                     'extra_tag': 'campaign/fgsm_xyz',
                     'attack_domain': 'point',
+                'attack_space': 'radar_measurement',
                 'attack_type': 'fgsm',
                 'attack_feature': 'xyz',
                 'epsilon': 0.05,
                 'epsilon_xyz': 0.01,
+                'epsilon_range': 0.1,
+                'epsilon_azimuth_deg': 0.2,
+                'epsilon_elevation_deg': 0.1,
                     'seed': 1024,
                 },
                 'metrics': {
@@ -125,6 +139,14 @@ class ExperimentRunnerTest(unittest.TestCase):
                     'attack_diagnostics': {
                         'iadv_singleton_group_ratio': 0.75,
                         'iadv_cross_target_neighbors': 0.0,
+                        'measurement_clean_active_current_target_points': 12,
+                        'measurement_max_abs_delta_range': 0.1,
+                        'measurement_max_abs_delta_azimuth_rad': 0.003,
+                        'measurement_max_abs_delta_elevation_rad': 0.002,
+                        'measurement_max_xyz_l2': 0.2,
+                        'measurement_mean_xyz_l2': 0.08,
+                        'measurement_historical_modification_count': 0,
+                        'measurement_non_target_modification_count': 0,
                     },
                     'vod_official': {
                         'clean': {
@@ -158,6 +180,10 @@ class ExperimentRunnerTest(unittest.TestCase):
             self.assertEqual(row['total_samples'], 1296)
             self.assertEqual(row['epsilon_default'], 0.05)
             self.assertEqual(row['epsilon_xyz'], 0.01)
+            self.assertEqual(row['attack_space'], 'radar_measurement')
+            self.assertEqual(row['epsilon_range'], 0.1)
+            self.assertEqual(row['measurement_active_current_points'], 12)
+            self.assertEqual(row['measurement_max_xyz_l2'], 0.2)
             self.assertEqual(row['entire_3d_map_drop'], 15.4)
             self.assertEqual(row['roi_adversarial_3d_map'], 44.0)
             self.assertEqual(row['iadv_singleton_group_ratio'], 0.75)
@@ -202,6 +228,12 @@ class ExperimentRunnerTest(unittest.TestCase):
             self.assertEqual(rows[0]['status'], 'pending')
             self.assertTrue((campaign_dir / 'summary.csv').is_file())
             self.assertTrue((campaign_dir / 'summary.md').is_file())
+            self.assertTrue(
+                (campaign_dir / 'comparison_summary.csv').is_file()
+            )
+            self.assertTrue(
+                (campaign_dir / 'comparison_summary.md').is_file()
+            )
 
 
 if __name__ == '__main__':

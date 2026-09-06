@@ -41,6 +41,16 @@ class PointCloudVoxelizer:
             )
         if self.max_points_per_voxel <= 0 or self.max_voxels <= 0:
             raise ValueError('voxel capacity values must be positive')
+        self.grid_size = tuple(
+            int(round(
+                (self.point_cloud_range[index + 3]
+                 - self.point_cloud_range[index])
+                / self.voxel_size[index]
+            ))
+            for index in range(3)
+        )
+        if any(size <= 0 for size in self.grid_size):
+            raise ValueError('voxel grid dimensions must be positive')
 
     def topology(self, points: torch.Tensor) -> VoxelTopology:
         if points.ndim != 2 or points.shape[1] < 4:
@@ -56,6 +66,16 @@ class PointCloudVoxelizer:
             coords_xyz = torch.floor((xyz - range_min) / voxel_size).long()
             batch_indices = points[:, 0].long()
             valid = ((xyz >= range_min) & (xyz < range_max)).all(dim=1)
+            # A float32 coordinate just below range_max can round to the
+            # first out-of-grid integer after division (for example,
+            # 25.599998 / 0.16 -> 320). Match the detector grid explicitly
+            # so PointPillarScatter never receives an invalid coordinate.
+            grid_size = torch.as_tensor(
+                self.grid_size, dtype=torch.long, device=device
+            )
+            valid &= (
+                (coords_xyz >= 0) & (coords_xyz < grid_size)
+            ).all(dim=1)
             valid &= (batch_indices >= 0) & (batch_indices < self.batch_size)
             valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
 

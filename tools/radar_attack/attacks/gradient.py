@@ -240,11 +240,43 @@ def point_cloud_attack(
     if attacked_values.shape[0] == 1:
         attacked_values = attacked_values.expand_as(original)
     delta = (adversarial - original).abs()[attacked_values]
+    changed_points = (adversarial != original).any(dim=1)
+    allowed_points = (
+        torch.ones_like(changed_points)
+        if point_mask is None
+        else point_mask.to(device=original.device, dtype=torch.bool)
+    )
+    non_mask_modifications = changed_points & ~allowed_points
+    non_selected_feature_modifications = (
+        (adversarial - original).abs() > 0
+    ) & ~(budget > 0).expand_as(original)
+    if non_mask_modifications.any():
+        raise RuntimeError('point attack modified a point outside its mask')
+    if non_selected_feature_modifications.any():
+        raise RuntimeError('point attack modified a non-selected feature')
+    xyz_l2 = torch.linalg.vector_norm(
+        adversarial[:, 1:4] - original[:, 1:4], dim=1
+    )
+    attacked_point_count = int(allowed_points.sum().item())
     stats = {
         'max_abs_perturbation': delta.max().item() if delta.numel() else 0.0,
         'mean_abs_perturbation': delta.mean().item() if delta.numel() else 0.0,
         'sum_abs_perturbation': delta.sum().item() if delta.numel() else 0.0,
         'perturbation_values': float(delta.numel()),
+        'point_attack_mask_points': float(attacked_point_count),
+        'point_modified_points': float(changed_points.sum().item()),
+        'point_non_mask_modification_count': float(
+            non_mask_modifications.sum().item()
+        ),
+        'point_non_selected_feature_modification_count': float(
+            non_selected_feature_modifications.sum().item()
+        ),
+        'point_max_xyz_l2': (
+            float(xyz_l2[allowed_points].max().item())
+            if attacked_point_count else 0.0
+        ),
+        'point_xyz_l2_sum': float(xyz_l2[allowed_points].sum().item()),
+        'point_xyz_l2_count': float(attacked_point_count),
     }
     if loss_stats is not None:
         stats.update({key: float(value) for key, value in loss_stats.items()})

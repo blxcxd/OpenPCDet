@@ -19,12 +19,17 @@ from tools.radar_attack.attacks import (
     build_iadv_attack_mask,
     build_iadv_groups,
     build_iadv_object_ids,
+    build_measurement_attack_mask,
     build_feature_mask,
+    cartesian_to_radar_measurement,
     compute_reflectivity_features,
     extremum_fusion,
     iadv_rcs_attack,
     point_cloud_attack,
     points_in_oriented_boxes,
+    project_radar_measurements,
+    radar_measurement_geometry_attack,
+    radar_measurement_to_cartesian,
     voxel_attack,
 )
 from tools.radar_attack.attacks.gradient import project_points
@@ -32,7 +37,12 @@ from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
     compare_target_object_endpoints,
+    build_target_screening_context,
+    merge_target_diagnostics,
     prepare_prediction_directory,
+    summarize_current_sweep,
+    target_attack_diagnostics,
+    target_correlations,
 )
 from tools.radar_attack.evaluation.vod import (
     _metric_difference,
@@ -71,6 +81,27 @@ class RadarAttackComponentTest(unittest.TestCase):
         np.testing.assert_array_equal(uniform, np.array([1, 5, 8]))
         np.testing.assert_array_equal(random_first, random_second)
         self.assertEqual(len(np.unique(random_first)), 5)
+
+    def test_voxelizer_rejects_float32_rounded_upper_grid_index(self):
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, -25.6, -3, 51.2, 25.6, 2],
+            voxel_size=[0.16, 0.16, 5],
+            max_points_per_voxel=10,
+            max_voxels=40000,
+            batch_size=1,
+        )
+        points = torch.tensor([
+            [0, 1.0, 0.0, 0.0, 1.0],
+            [0, 1.0, 25.599998, 0.0, 2.0],
+        ], dtype=torch.float32)
+
+        topology = voxelizer.topology(points)
+
+        self.assertEqual(topology.voxel_coords.shape[0], 1)
+        self.assertLess(topology.voxel_coords[:, 2].max().item(), 320)
+        self.assertEqual(
+            topology.point_indices[topology.point_mask].tolist(), [0]
+        )
 
     def test_extract_voxelized_features_excludes_zero_padding(self):
         voxels = np.array(
@@ -326,6 +357,276 @@ class RadarAttackComponentTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(output.adv_points[0, 4].item(), 1.8, places=6)
+
+    def test_radar_measurement_cartesian_round_trip(self):
+        xyz = torch.tensor(
+            [
+                [10.0, 0.0, 0.0],
+                [5.0, 2.0, 1.0],
+                [7.0, -3.0, -0.5],
+                [0.0, 4.0, 2.0],
+            ],
+            dtype=torch.float64,
+        )
+
+        measurement = cartesian_to_radar_measurement(xyz)
+        reconstructed = radar_measurement_to_cartesian(measurement)
+
+        self.assertTrue(torch.allclose(reconstructed, xyz, atol=1e-12))
+        self.assertAlmostEqual(measurement[0, 1].item(), 0.0)
+        self.assertGreater(measurement[1, 1].item(), 0.0)
+        self.assertLess(measurement[2, 1].item(), 0.0)
+
+    def test_measurement_mask_keeps_only_current_clean_active_targets(self):
+        points = torch.tensor(
+            [
+                [0.0, 1.1, 1.1, 1.1, 2.0, 0.5, 0.1, 0.0],
+                [0.0, 1.2, 1.2, 1.2, 3.0, 0.6, 0.2, 0.0],
+                [0.0, 2.1, 2.1, 2.1, 4.0, 0.7, 0.3, -1.0],
+                [0.0, 3.1, 3.1, 3.1, 5.0, 0.8, 0.4, 0.0],
+            ]
+        )
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, 0, 0, 5, 5, 5],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=1,
+            max_voxels=10,
+            batch_size=1,
+        )
+        target_mask = torch.tensor([True, True, True, False])
+
+        attack_mask, stats = build_measurement_attack_mask(
+            points,
+            ['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'],
+            target_mask,
+            voxelizer,
+        )
+
+        self.assertEqual(attack_mask.tolist(), [True, False, False, False])
+        self.assertEqual(stats['measurement_target_points'], 3.0)
+        self.assertEqual(stats['measurement_current_target_points'], 2.0)
+        self.assertEqual(stats['measurement_historical_target_points'], 1.0)
+        self.assertEqual(
+            stats['measurement_clean_active_current_target_points'], 1.0
+        )
+
+    def test_xyz_current_and_measurement_use_identical_point_ids(self):
+        points = torch.tensor(
+            [
+                [0.0, 2.0, 0.1, 0.0, 2.0, 0.5, 0.1, 0.0],
+                [0.0, 2.1, 0.1, 0.0, 2.0, 0.5, 0.1, 0.0],
+                [0.0, 2.2, 0.1, 0.0, 2.0, 0.5, 0.1, -1.0],
+                [0.0, 4.0, 0.0, 0.0, 2.0, 0.5, 0.1, 0.0],
+            ]
+        )
+        feature_names = [
+            'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        ]
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, -5, -5, 6, 5, 5],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=1,
+            max_voxels=10,
+            batch_size=1,
+        )
+        batch_dict = {
+            'points': points,
+            'batch_size': 1,
+            'gt_boxes': torch.tensor([[[2.1, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0]]]),
+        }
+        clean_records = {0: [{
+            'frame_id': '00001', 'object_id': 0, 'gt_row': 0,
+            'class_name': 'Car', 'clean_match_score': 0.9,
+            'clean_max_iou': 0.8,
+        }]}
+        context = build_target_screening_context(
+            points, batch_dict, clean_records, feature_names, voxelizer
+        )
+        measurement_ids, _ = build_measurement_attack_mask(
+            points, feature_names, context.target_mask, voxelizer
+        )
+        xyz_current_ids = (
+            context.target_mask & context.current_mask & context.active_mask
+        )
+
+        self.assertTrue(torch.equal(xyz_current_ids, measurement_ids))
+        self.assertEqual(
+            torch.nonzero(measurement_ids).flatten().tolist(), [0]
+        )
+
+    def test_target_screening_and_reassignment_diagnostics(self):
+        points = torch.tensor(
+            [
+                [0.0, 0.9, 0.0, 0.0, 2.0, 0.5, 0.1, 0.0],
+                [0.0, 1.1, 0.0, 0.0, 2.0, 0.5, 0.1, -1.0],
+                [0.0, 3.0, 0.0, 0.0, 2.0, 0.5, 0.1, 0.0],
+            ]
+        )
+        feature_names = [
+            'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        ]
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, -5, -5, 6, 5, 5],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=4,
+            max_voxels=10,
+            batch_size=1,
+        )
+        batch_dict = {
+            'points': points,
+            'batch_size': 1,
+            'gt_boxes': torch.tensor([[[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0]]]),
+        }
+        clean_records = {0: [{
+            'frame_id': '00001', 'object_id': 0, 'gt_row': 0,
+            'class_name': 'Car', 'clean_match_score': 0.9,
+            'clean_max_iou': 0.8,
+        }]}
+        context = build_target_screening_context(
+            points, batch_dict, clean_records, feature_names, voxelizer
+        )
+        attack_mask, _ = build_measurement_attack_mask(
+            points, feature_names, context.target_mask, voxelizer
+        )
+        adversarial = points.clone()
+        adversarial[0, 1] = 1.01
+        diagnostics = target_attack_diagnostics(
+            context, adversarial, attack_mask
+        )
+        record = diagnostics[(0, 0)]
+
+        self.assertEqual(record['num_object_points_total'], 2)
+        self.assertEqual(record['num_time0_points'], 1)
+        self.assertEqual(record['num_history_points'], 1)
+        self.assertEqual(record['num_active_time0_points'], 1)
+        self.assertEqual(record['num_reassigned_points'], 1)
+        self.assertEqual(record['pillar_reassignment_rate'], 1.0)
+        endpoint = [{
+            'batch_index': 0, 'gt_row': 0,
+            'adversarial_match_score': 0.5, 'match_score_drop': 0.4,
+            'adversarial_max_iou': 0.3, 'max_iou_drop': 0.5,
+            'clean_object_evidence': 1.2,
+            'adversarial_object_evidence': 0.8,
+            'object_evidence_drop': 0.4, 'object_failure': True,
+            'adversarial_center_error': 0.2,
+        }]
+        merge_target_diagnostics(endpoint, diagnostics)
+        summary = summarize_current_sweep(endpoint)
+        correlations = target_correlations(endpoint)
+        self.assertTrue(endpoint[0]['object_attack_success'])
+        self.assertEqual(summary['clean_detected_targets'], 1)
+        self.assertEqual(summary['active_time0_le_1_fraction'], 1.0)
+        self.assertIn('pillar_reassignment_rate_vs_iou_drop', correlations)
+
+    def test_measurement_projection_backtracks_without_cartesian_clipping(self):
+        xyz = torch.tensor([[0.01, 0.0, 0.0]], dtype=torch.float64)
+        original = cartesian_to_radar_measurement(xyz)
+        budget = torch.tensor([[0.0, torch.pi, 0.0]], dtype=torch.float64)
+        candidate = original + budget
+
+        projected, stats = project_radar_measurements(
+            candidate,
+            original,
+            budget,
+            torch.tensor([True]),
+            point_cloud_range=[0, -1, -1, 1, 1, 1],
+        )
+        reconstructed = radar_measurement_to_cartesian(projected)
+
+        self.assertGreater(stats['measurement_out_of_range_backtracks'], 0)
+        self.assertGreaterEqual(reconstructed[0, 0].item(), 0.0)
+        self.assertLessEqual(
+            (projected - original).abs()[0, 1].item(), torch.pi
+        )
+
+    def test_measurement_attack_is_current_target_only_and_budgeted(self):
+        points = torch.tensor(
+            [
+                [0.0, 2.0, 0.3, 0.2, 2.0, 0.5, 0.1, 0.0],
+                [0.0, 3.0, 0.4, 0.1, 3.0, 0.6, 0.2, -1.0],
+                [0.0, 4.0, -0.2, 0.3, 4.0, 0.7, 0.3, 0.0],
+            ]
+        )
+        feature_names = [
+            'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        ]
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, -5, -5, 6, 5, 5],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=4,
+            max_voxels=10,
+            batch_size=1,
+        )
+        target_mask = torch.tensor([True, True, False])
+
+        output = radar_measurement_geometry_attack(
+            model=SumVoxelModel(),
+            batch_dict={'points': points, 'batch_size': 1},
+            voxelizer=voxelizer,
+            feature_names=feature_names,
+            attack_type='pgd',
+            epsilon_range=0.1,
+            epsilon_azimuth=0.05,
+            epsilon_elevation=0.02,
+            pgd_steps=2,
+            target_mask=target_mask,
+        )
+
+        self.assertFalse(torch.equal(output.adv_points[0, 1:4], points[0, 1:4]))
+        self.assertTrue(torch.equal(output.adv_points[1], points[1]))
+        self.assertTrue(torch.equal(output.adv_points[2], points[2]))
+        self.assertTrue(torch.equal(output.adv_points[:, 4:], points[:, 4:]))
+        clean_measurement = cartesian_to_radar_measurement(points[:, 1:4])
+        adv_measurement = cartesian_to_radar_measurement(
+            output.adv_points[:, 1:4]
+        )
+        delta = (adv_measurement - clean_measurement).abs()[0]
+        self.assertLessEqual(delta[0].item(), 0.1 + 1e-6)
+        self.assertLessEqual(delta[1].item(), 0.05 + 1e-6)
+        self.assertLessEqual(delta[2].item(), 0.02 + 1e-6)
+        reconstructed = radar_measurement_to_cartesian(adv_measurement)
+        self.assertTrue(torch.allclose(
+            reconstructed, output.adv_points[:, 1:4], atol=1e-6
+        ))
+        self.assertEqual(
+            output.stats['measurement_historical_modification_count'], 0.0
+        )
+        self.assertEqual(
+            output.stats['measurement_non_target_modification_count'], 0.0
+        )
+        self.assertEqual(
+            output.stats['measurement_non_geometry_modification_count'], 0.0
+        )
+
+    def test_zero_budget_measurement_attack_is_exactly_clean(self):
+        points = torch.tensor(
+            [[0.0, 2.0, 0.3, 0.2, 2.0, 0.5, 0.1, 0.0]]
+        )
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, -5, -5, 6, 5, 5],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=4,
+            max_voxels=10,
+            batch_size=1,
+        )
+
+        output = radar_measurement_geometry_attack(
+            model=SumVoxelModel(),
+            batch_dict={'points': points, 'batch_size': 1},
+            voxelizer=voxelizer,
+            feature_names=[
+                'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+            ],
+            attack_type='pgd',
+            epsilon_range=0.0,
+            epsilon_azimuth=0.0,
+            epsilon_elevation=0.0,
+            pgd_steps=2,
+            target_mask=torch.tensor([True]),
+        )
+
+        self.assertTrue(torch.equal(output.adv_points, points))
+        self.assertEqual(output.stats['max_abs_perturbation'], 0.0)
 
     def test_oriented_box_mask_and_target_class_filter(self):
         xyz = torch.tensor(
@@ -642,6 +943,10 @@ class RadarAttackComponentTest(unittest.TestCase):
                 'iadv_cross_target_neighbors': 0,
                 'object_evidence_targets': 2,
                 'object_evidence_candidate_anchors': 20,
+                'measurement_clean_active_current_target_points': 4,
+                'measurement_xyz_l2_sum': 0.8,
+                'measurement_max_xyz_l2': 0.3,
+                'measurement_historical_modification_count': 0,
             }
         )
         metrics.update_object_endpoints(
@@ -678,6 +983,11 @@ class RadarAttackComponentTest(unittest.TestCase):
         self.assertEqual(diagnostics['iadv_valid_targets'], 2)
         self.assertEqual(diagnostics['iadv_mean_points_per_target'], 4)
         self.assertEqual(diagnostics['iadv_mean_points_per_group'], 1.6)
+        self.assertAlmostEqual(diagnostics['measurement_mean_xyz_l2'], 0.2)
+        self.assertAlmostEqual(diagnostics['measurement_max_xyz_l2'], 0.3)
+        self.assertEqual(
+            diagnostics['measurement_historical_modification_count'], 0
+        )
         self.assertEqual(diagnostics['iadv_singleton_group_ratio'], 0.6)
         self.assertEqual(diagnostics['iadv_pca_fallback_rate'], 0.25)
         self.assertEqual(diagnostics['object_evidence_targets'], 2)

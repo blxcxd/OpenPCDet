@@ -21,6 +21,8 @@ from tools.radar_attack.analysis import (
 from tools.radar_attack.attacks.objective import (
     ObjectEvidenceObjective,
     ObjectEvidenceTarget,
+    differentiable_oriented_iou3d,
+    radar_object_iou_s,
 )
 
 
@@ -212,6 +214,83 @@ class ObjectDiagnosticTest(unittest.TestCase):
         self.assertGreater(float(box_gradient[..., 0].item()), 0.0)
         self.assertEqual(
             objective.stats['object_hybrid_localization_anchors'], 1.0
+        )
+
+    def test_yaw_aware_iou_s_suppresses_score_and_pushes_box_away(self):
+        logits = torch.tensor([2.0], requires_grad=True)
+        predicted = torch.tensor(
+            [[0.2, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0]],
+            requires_grad=True,
+        )
+        target = torch.tensor([0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0])
+
+        objective = radar_object_iou_s(logits, predicted, target)
+        objective.backward()
+
+        self.assertLess(float(logits.grad.item()), 0.0)
+        self.assertGreater(float(predicted.grad[0, 0].item()), 0.0)
+        rotated = target.clone()
+        rotated[6] = torch.pi / 4
+        rotated_iou = differentiable_oriented_iou3d(
+            rotated[None, :], target[None, :]
+        )
+        self.assertAlmostEqual(float(rotated_iou.item()), 2 ** -0.5, places=5)
+
+    def test_iou_s_balances_targets_by_class(self):
+        class DenseHead:
+            forward_ret_dict = {
+                'cls_preds': torch.zeros((1, 1, 1, 6), requires_grad=True),
+                'box_preds': torch.zeros((1, 1, 1, 21), requires_grad=True),
+            }
+
+            @staticmethod
+            def generate_predicted_boxes(
+                batch_size, cls_preds, box_preds, dir_cls_preds=None
+            ):
+                del batch_size, dir_cls_preds
+                logits = cls_preds.reshape(1, 3, 2)
+                boxes = box_preds.reshape(1, 3, 7).clone()
+                boxes[..., 3:6] = 1.0
+                boxes[..., 0] = 10.0
+                return logits, boxes
+
+        class Model:
+            dense_head = DenseHead()
+
+        gt = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0])
+        targets = [
+            ObjectEvidenceTarget(
+                batch_index=0,
+                gt_index=index,
+                class_id=class_id,
+                candidate_indices=torch.tensor([index]),
+                clean_iou=0.8,
+                clean_score=0.9,
+                iou_s_indices=torch.tensor([index]),
+                iou_s_gt_box=gt,
+            )
+            for index, class_id in enumerate((1, 1, 2))
+        ]
+        objective = ObjectEvidenceObjective(
+            targets=targets,
+            target_boxes_by_batch={},
+            num_classes=2,
+            temperature=1.0,
+            objective_type='object_iou_s',
+            iou_s_score_weight=1.0,
+            iou_s_iou_weight=0.0,
+        )
+
+        objective(Model()).backward()
+        gradients = Model.dense_head.forward_ret_dict['cls_preds'].grad.reshape(
+            3, 2
+        )
+
+        self.assertAlmostEqual(
+            float(gradients[2, 1] / gradients[0, 0]), 2.0, places=6
+        )
+        self.assertAlmostEqual(
+            float(gradients[0, 0]), float(gradients[1, 0]), places=6
         )
 
     def test_allocations_sum_to_one_and_identify_dominant_domain(self):

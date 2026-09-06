@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import datetime
+import math
 from functools import partial
 from pathlib import Path
 
@@ -27,15 +28,34 @@ from radar_attack.adapters.openpcdet import (
 )
 from radar_attack.attacks.gradient import point_cloud_attack
 from radar_attack.attacks.iadv import build_iadv_attack_mask, iadv_rcs_attack
+from radar_attack.attacks.measurement import (
+    TEMPORAL_PARAMETER_MODES,
+    build_measurement_attack_mask,
+    build_temporal_measurement_attack_mask,
+    radar_measurement_geometry_attack,
+    radar_temporal_measurement_geometry_attack,
+)
 from radar_attack.attacks.objective import ObjectEvidenceObjective
 from radar_attack.attacks.voxel import voxel_attack
 from radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    build_target_screening_context,
     compare_target_object_endpoints,
     evaluate_vod_pair,
+    merge_target_diagnostics,
     prepare_prediction_directory,
     resolve_vod_label_dir,
+    summarize_current_sweep,
+    set_temporal_screening_assignments,
+    target_attack_diagnostics,
+    target_correlations,
+    write_correlation_output,
+    write_current_sweep_outputs,
+)
+from radar_attack.temporal import (
+    TemporalSweepResolver,
+    build_temporal_batch_data,
 )
 
 
@@ -159,6 +179,15 @@ def parse_config():
     parser.add_argument('--attack_feature', type=str, default='all',
                         choices=['all', 'xyz', 'doppler', 'intensity', 'rcs', 'time'],
                         help='which features to perturb')
+    parser.add_argument(
+        '--attack_space', choices=['feature', 'radar_measurement'],
+        default='feature',
+        help=(
+            'feature uses the existing independent input channels; '
+            'radar_measurement optimizes current-sweep range/angles and '
+            'reconstructs XYZ'
+        ),
+    )
     parser.add_argument('--attack_type', type=str, default='fgsm',
                         choices=['fgsm', 'pgd', 'iadv'],
                         help='attack type: fgsm, pgd, or I-ADV-RCS')
@@ -173,8 +202,53 @@ def parse_config():
                         help='point attack Doppler budget, overriding epsilon')
     parser.add_argument('--epsilon_time', type=float, default=None,
                         help='point attack timestamp budget, overriding epsilon')
+    parser.add_argument('--epsilon_range', type=float, default=None,
+                        help='measurement-space range budget in metres')
+    parser.add_argument('--epsilon_azimuth_deg', type=float, default=None,
+                        help='measurement-space azimuth budget in degrees')
+    parser.add_argument('--epsilon_elevation_deg', type=float, default=None,
+                        help='measurement-space elevation budget in degrees')
+    parser.add_argument('--step_size_range', type=float, default=None,
+                        help='measurement PGD range step in metres')
+    parser.add_argument('--step_size_azimuth_deg', type=float, default=None,
+                        help='measurement PGD azimuth step in degrees')
+    parser.add_argument('--step_size_elevation_deg', type=float, default=None,
+                        help='measurement PGD elevation step in degrees')
     parser.add_argument('--random_start', action='store_true',
                         help='use a random PGD start for point attack')
+    parser.add_argument(
+        '--current_sweep_only', action='store_true',
+        help=(
+            'for feature-space point attacks, restrict the clean target mask '
+            'to time=0 points retained by clean hard voxelization'
+        ),
+    )
+    parser.add_argument(
+        '--temporal_mode',
+        choices=['none', *TEMPORAL_PARAMETER_MODES],
+        default='none',
+        help=(
+            'all non-none modes attack every available source sweep; '
+            'point_independent gives each target point its own measurement '
+            'delta, object_per_sweep shares within each target and sweep, '
+            'and track_shared shares across the full tracking ID'
+        ),
+    )
+    parser.add_argument(
+        '--temporal_dataset_root', type=str, default=None,
+        help=(
+            'VoD root containing radar, radar_5frames and lidar; default '
+            'is inferred from the configured dataset root'
+        ),
+    )
+    parser.add_argument(
+        '--temporal_cache_dir', type=str, default=None,
+        help='temporal transform cache directory',
+    )
+    parser.add_argument(
+        '--temporal_max_residual_m', type=float, default=2e-5,
+        help='maximum accepted single-to-accumulated rigid residual',
+    )
     parser.add_argument('--voxel_mode', type=str, default='fixed',
                         choices=['fixed', 'revoxelize'],
                         help='point topology: fixed pillars or per-step revoxelization')
@@ -201,7 +275,9 @@ def parse_config():
     )
     parser.add_argument(
         '--attack_loss',
-        choices=['training', 'object_evidence', 'object_hybrid'],
+        choices=[
+            'training', 'object_evidence', 'object_hybrid', 'object_iou_s'
+        ],
         default='training',
         help='gradient objective for point FGSM/PGD',
     )
@@ -222,6 +298,14 @@ def parse_config():
                         help='weight of target-specific box regression divergence')
     parser.add_argument('--hybrid_localization_topk', type=int, default=32,
                         help='clean high-IoU anchors used by the hybrid localization term')
+    parser.add_argument('--iou_s_candidate_topk', type=int, default=32,
+                        help='clean high-IoU anchors retained per IoU-S target')
+    parser.add_argument('--iou_s_score_weight', type=float, default=1.0,
+                        help='weight of the IoU-S confidence-suppression term')
+    parser.add_argument('--iou_s_iou_weight', type=float, default=1.0,
+                        help='weight of the IoU-S differentiable 3D-IoU term')
+    parser.add_argument('--iou_s_log_epsilon', type=float, default=1e-6,
+                        help='numerical epsilon inside IoU-S logarithms')
     parser.add_argument('--iadv_steps', type=int, default=10,
                         help='I-ADV iteration count')
     parser.add_argument('--iadv_scope', choices=['gt_boxes', 'scene'],
@@ -334,7 +418,44 @@ def parse_config():
             parser.error(
                 '--iadv_neighbor_scope object requires --iadv_scope gt_boxes'
             )
-    if args.attack_loss in {'object_evidence', 'object_hybrid'}:
+    if args.attack_space == 'radar_measurement':
+        if args.attack_domain != 'point':
+            parser.error('--attack_space radar_measurement requires --attack_domain point')
+        if args.attack_type not in {'fgsm', 'pgd'}:
+            parser.error('--attack_space radar_measurement supports FGSM/PGD only')
+        if args.attack_feature != 'xyz':
+            parser.error('--attack_space radar_measurement requires --attack_feature xyz')
+        if args.point_scope == 'scene' and (
+            args.temporal_mode != 'point_independent'
+        ):
+            parser.error(
+                'scene-wide radar measurement attack requires '
+                '--temporal_mode point_independent'
+            )
+        if args.voxel_mode != 'revoxelize':
+            parser.error(
+                '--attack_space radar_measurement requires '
+                '--voxel_mode revoxelize'
+            )
+        if args.step_size is not None:
+            parser.error(
+                'measurement attack uses the three measurement-specific '
+                'step-size options, not --step_size'
+            )
+        required_budgets = (
+            'epsilon_range',
+            'epsilon_azimuth_deg',
+            'epsilon_elevation_deg',
+        )
+        missing = [name for name in required_budgets if getattr(args, name) is None]
+        if missing:
+            parser.error(
+                '--attack_space radar_measurement requires explicit '
+                + ', '.join(f'--{name}' for name in missing)
+            )
+    if args.attack_loss in {
+        'object_evidence', 'object_hybrid', 'object_iou_s'
+    }:
         if args.attack_domain != 'point' or args.attack_type == 'iadv':
             parser.error(
                 'object attack losses support point FGSM/PGD only'
@@ -356,6 +477,33 @@ def parse_config():
             '--point_target_selection clean_detected supports point FGSM/PGD '
             'with --point_scope gt_boxes only'
         )
+    if args.current_sweep_only and (
+        args.attack_domain != 'point'
+        or args.attack_type == 'iadv'
+        or args.point_scope != 'gt_boxes'
+    ):
+        parser.error(
+            '--current_sweep_only supports point FGSM/PGD with '
+            '--point_scope gt_boxes only'
+        )
+    if args.temporal_mode != 'none':
+        if args.attack_space != 'radar_measurement':
+            parser.error(
+                'non-none --temporal_mode requires '
+                '--attack_space radar_measurement'
+            )
+        if args.current_sweep_only:
+            parser.error(
+                'non-none --temporal_mode conflicts with '
+                '--current_sweep_only'
+            )
+        if args.launcher != 'none':
+            parser.error(
+                'non-none --temporal_mode currently requires '
+                '--launcher none'
+            )
+    if args.temporal_max_residual_m <= 0:
+        parser.error('--temporal_max_residual_m must be positive')
     if args.iadv_attack_voxel_size <= 0:
         parser.error('--iadv_attack_voxel_size must be positive')
     if args.iadv_mu < 0:
@@ -392,6 +540,16 @@ def parse_config():
         )
     if args.hybrid_localization_topk <= 0:
         parser.error('--hybrid_localization_topk must be positive')
+    if args.iou_s_candidate_topk <= 0:
+        parser.error('--iou_s_candidate_topk must be positive')
+    if args.iou_s_score_weight < 0 or args.iou_s_iou_weight < 0:
+        parser.error('--iou_s_score_weight and --iou_s_iou_weight must be non-negative')
+    if (args.attack_loss == 'object_iou_s'
+            and args.iou_s_score_weight == 0
+            and args.iou_s_iou_weight == 0):
+        parser.error('--attack_loss object_iou_s requires a positive IoU-S weight')
+    if not 0 < args.iou_s_log_epsilon < 1:
+        parser.error('--iou_s_log_epsilon must be in (0, 1)')
     if (args.iadv_rcs_min is not None and args.iadv_rcs_max is not None
             and args.iadv_rcs_min > args.iadv_rcs_max):
         parser.error('--iadv_rcs_min must not exceed --iadv_rcs_max')
@@ -404,6 +562,19 @@ def parse_config():
         value = getattr(args, name)
         if value is not None and value < 0:
             parser.error(f'--{name} must be non-negative')
+    for name in (
+        'epsilon_range', 'epsilon_azimuth_deg', 'epsilon_elevation_deg',
+    ):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error(f'--{name} must be non-negative')
+    for name in (
+        'step_size_range', 'step_size_azimuth_deg',
+        'step_size_elevation_deg',
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f'--{name} must be positive')
 
     cfg_from_yaml_file(args.cfg_file, cfg)
     cfg.TAG = Path(args.cfg_file).stem
@@ -412,6 +583,9 @@ def parse_config():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    args.measurement_budget_semantics = (
+        'research_digital_not_validated_physical_sensor_uncertainty'
+    )
 
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
@@ -424,7 +598,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     if (args.point_target_selection == 'clean_detected'
             and model.dense_head.__class__.__name__ != 'AnchorHeadSingle'):
         raise NotImplementedError(
-            'clean-detected target selection and object evidence currently '
+            'clean-detected target selection and object losses currently '
             'support AnchorHeadSingle only; got '
             f'{model.dense_head.__class__.__name__}'
         )
@@ -472,6 +646,28 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     clean_prediction_dir = None
     adversarial_prediction_dir = None
     vod_label_dir = None
+    temporal_resolver = None
+
+    if args.temporal_mode != 'none':
+        configured_root = Path(dataset.root_path).expanduser().resolve()
+        temporal_dataset_root = (
+            Path(args.temporal_dataset_root).expanduser().resolve()
+            if args.temporal_dataset_root is not None
+            else configured_root.parent
+        )
+        temporal_cache_dir = (
+            Path(args.temporal_cache_dir).expanduser().resolve()
+            if args.temporal_cache_dir is not None
+            else cfg.ROOT_DIR / 'output/radar_attack/temporal_sweep_cache'
+        )
+        temporal_resolver = TemporalSweepResolver(
+            dataset_root=temporal_dataset_root,
+            cache_dir=temporal_cache_dir,
+            max_residual_m=args.temporal_max_residual_m,
+        )
+        logger.info('Temporal mode: %s', args.temporal_mode)
+        logger.info('Temporal VoD root: %s', temporal_dataset_root)
+        logger.info('Temporal transform cache: %s', temporal_cache_dir)
 
     if args.vod_eval:
         prediction_root = output_dir / 'vod_predictions'
@@ -521,11 +717,27 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'attack_domain': args.attack_domain,
                     'attack_type': args.attack_type,
                     'attack_feature': args.attack_feature,
+                    'attack_space': args.attack_space,
                     'epsilon': args.epsilon,
                     'epsilon_xyz': args.epsilon_xyz,
                     'epsilon_rcs': args.epsilon_rcs,
                     'epsilon_doppler': args.epsilon_doppler,
                     'epsilon_time': args.epsilon_time,
+                    'epsilon_range': args.epsilon_range,
+                    'epsilon_azimuth_deg': args.epsilon_azimuth_deg,
+                    'epsilon_elevation_deg': args.epsilon_elevation_deg,
+                    'step_size_range': args.step_size_range,
+                    'step_size_azimuth_deg': args.step_size_azimuth_deg,
+                    'step_size_elevation_deg': args.step_size_elevation_deg,
+                    'measurement_budget_semantics': (
+                        args.measurement_budget_semantics
+                    ),
+                    'temporal_mode': args.temporal_mode,
+                    'temporal_dataset_root': args.temporal_dataset_root,
+                    'temporal_cache_dir': args.temporal_cache_dir,
+                    'temporal_max_residual_m': (
+                        args.temporal_max_residual_m
+                    ),
                     'pgd_steps': args.pgd_steps,
                     'step_size': args.step_size,
                     'random_start': args.random_start,
@@ -552,6 +764,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'hybrid_localization_topk': (
                         args.hybrid_localization_topk
                     ),
+                    'iou_s_candidate_topk': args.iou_s_candidate_topk,
+                    'iou_s_score_weight': args.iou_s_score_weight,
+                    'iou_s_iou_weight': args.iou_s_iou_weight,
+                    'iou_s_log_epsilon': args.iou_s_log_epsilon,
                     'iadv_steps': args.iadv_steps,
                     'iadv_scope': args.iadv_scope,
                     'iadv_neighbor_scope': args.iadv_neighbor_scope,
@@ -608,6 +824,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
 
         objective = None
         clean_object_evidence = None
+        target_context = None
+        target_diagnostics = None
+        attack_point_mask = None
+        clean_records_by_batch = {}
         if args.attack_domain == 'point':
             original_points = batch_dict['points'].detach().clone()
             voxelizer = PointCloudVoxelizer(
@@ -645,7 +865,24 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 )
             else:
                 point_mask = None
+                allowed_rows = None
+                temporal_data = None
                 if args.point_target_selection == 'clean_detected':
+                    for batch_index, clean_prediction in enumerate(
+                        pred_dicts_original
+                    ):
+                        _, clean_records = compare_target_object_endpoints(
+                            clean_prediction=clean_prediction,
+                            adversarial_prediction=clean_prediction,
+                            gt_boxes=batch_dict['gt_boxes'][batch_index],
+                            target_classes=selected_classes,
+                            iou_thresholds=object_iou_thresholds,
+                            frame_id=batch_dict['frame_id'][batch_index],
+                            object_score_threshold=object_score_threshold,
+                            class_names=all_class_names,
+                            batch_index=batch_index,
+                        )
+                        clean_records_by_batch[batch_index] = clean_records
                     objective = ObjectEvidenceObjective.from_clean_predictions(
                         model=model,
                         batch_dict=batch_dict,
@@ -662,8 +899,37 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                             else 0.0
                         ),
                         localization_topk=args.hybrid_localization_topk,
+                        objective_type=(
+                            args.attack_loss
+                            if args.attack_loss != 'training'
+                            else 'object_evidence'
+                        ),
+                        iou_s_candidate_topk=args.iou_s_candidate_topk,
+                        iou_s_score_weight=args.iou_s_score_weight,
+                        iou_s_iou_weight=args.iou_s_iou_weight,
+                        iou_s_log_epsilon=args.iou_s_log_epsilon,
                     )
-                    point_mask = objective.point_mask(original_points)
+                    allowed_rows = {
+                        batch_index: [
+                            int(record['gt_row']) for record in records
+                        ]
+                        for batch_index, records
+                        in clean_records_by_batch.items()
+                    }
+                    objective = objective.restricted_to_gt_rows(
+                        allowed_rows,
+                        batch_dict,
+                        point_box_margin=args.point_box_margin,
+                    )
+                    target_context = build_target_screening_context(
+                        points=original_points,
+                        batch_dict=batch_dict,
+                        clean_records_by_batch=clean_records_by_batch,
+                        feature_names=feature_names,
+                        voxelizer=voxelizer,
+                        box_margin=args.point_box_margin,
+                    )
+                    point_mask = target_context.target_mask
                     clean_object_evidence = objective.evidence_by_target(model)
                 elif args.point_scope == 'gt_boxes':
                     point_mask = build_iadv_attack_mask(
@@ -673,29 +939,173 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                         target_class_ids=target_class_ids,
                         box_margin=args.point_box_margin,
                     )
-                attack_output = point_cloud_attack(
-                    model=model,
-                    batch_dict=batch_dict,
-                    voxelizer=voxelizer,
-                    feature_names=feature_names,
-                    attack_type=args.attack_type,
-                    attack_feature=args.attack_feature,
-                    epsilon=args.epsilon,
-                    epsilon_overrides=epsilon_overrides,
-                    pgd_steps=args.pgd_steps,
-                    step_size=args.step_size,
-                    random_start=args.random_start,
-                    voxel_mode=args.voxel_mode,
-                    point_mask=point_mask,
-                    loss_fn=(
-                        objective
-                        if args.attack_loss in {
-                            'object_evidence', 'object_hybrid'
-                        }
-                        else None
-                    ),
-                    loss_stats=objective.stats if objective is not None else None,
+                target_mask = point_mask
+                mask_stats = None
+                if (
+                    args.attack_space == 'radar_measurement'
+                    and args.temporal_mode != 'none'
+                ):
+                    temporal_data = build_temporal_batch_data(
+                        resolver=temporal_resolver,
+                        batched_points=(
+                            original_points.detach().cpu().numpy()
+                        ),
+                        frame_ids=batch_dict['frame_id'],
+                        gt_boxes=(
+                            batch_dict['gt_boxes'].detach().cpu().numpy()
+                        ),
+                        target_classes=target_class_names,
+                        dataset_classes=dataset.class_names,
+                        allowed_gt_rows=allowed_rows,
+                        box_margin=args.point_box_margin,
+                    )
+                    point_mask, raw_mask_stats = (
+                        build_temporal_measurement_attack_mask(
+                            original_points,
+                            temporal_data,
+                            voxelizer,
+                            point_scope=args.point_scope,
+                        )
+                    )
+                    mask_stats = {
+                        'temporal_attack_target_points': raw_mask_stats[
+                            'measurement_target_points'
+                        ],
+                        'temporal_attack_current_points': raw_mask_stats[
+                            'measurement_current_target_points'
+                        ],
+                        'temporal_attack_historical_points': raw_mask_stats[
+                            'measurement_historical_target_points'
+                        ],
+                        'temporal_attack_clean_active_points': raw_mask_stats[
+                            'measurement_clean_active_target_points'
+                        ],
+                    }
+                    if target_context is not None:
+                        set_temporal_screening_assignments(
+                            target_context,
+                            torch.as_tensor(
+                                temporal_data.gt_rows,
+                                dtype=torch.long,
+                                device=original_points.device,
+                            ),
+                            torch.as_tensor(
+                                temporal_data.source_xyz,
+                                dtype=original_points.dtype,
+                                device=original_points.device,
+                            ),
+                            torch.as_tensor(
+                                temporal_data.rotations,
+                                dtype=original_points.dtype,
+                                device=original_points.device,
+                            ),
+                        )
+                elif (
+                    args.attack_space == 'radar_measurement'
+                    or args.current_sweep_only
+                ):
+                    point_mask, raw_mask_stats = build_measurement_attack_mask(
+                        original_points,
+                        feature_names,
+                        target_mask,
+                        voxelizer,
+                    )
+                    mask_stats = {
+                        'current_sweep_target_points': raw_mask_stats[
+                            'measurement_target_points'
+                        ],
+                        'current_sweep_time0_target_points': raw_mask_stats[
+                            'measurement_current_target_points'
+                        ],
+                        'current_sweep_history_target_points': raw_mask_stats[
+                            'measurement_historical_target_points'
+                        ],
+                        'current_sweep_clean_active_target_points': raw_mask_stats[
+                            'measurement_clean_active_current_target_points'
+                        ],
+                    }
+                attack_point_mask = point_mask
+                loss_fn = (
+                    objective
+                    if args.attack_loss in {
+                        'object_evidence', 'object_hybrid', 'object_iou_s'
+                    }
+                    else None
                 )
+                loss_stats = dict(objective.stats) if objective is not None else {}
+                if mask_stats is not None:
+                    loss_stats.update(mask_stats)
+                loss_stats = loss_stats or None
+                if args.attack_space == 'radar_measurement':
+                    measurement_kwargs = {
+                        'model': model,
+                        'batch_dict': batch_dict,
+                        'voxelizer': voxelizer,
+                        'attack_type': args.attack_type,
+                        'epsilon_range': args.epsilon_range,
+                        'epsilon_azimuth': math.radians(
+                            args.epsilon_azimuth_deg
+                        ),
+                        'epsilon_elevation': math.radians(
+                            args.epsilon_elevation_deg
+                        ),
+                        'pgd_steps': args.pgd_steps,
+                        'step_size_range': args.step_size_range,
+                        'step_size_azimuth': (
+                            math.radians(args.step_size_azimuth_deg)
+                            if args.step_size_azimuth_deg is not None
+                            else None
+                        ),
+                        'step_size_elevation': (
+                            math.radians(args.step_size_elevation_deg)
+                            if args.step_size_elevation_deg is not None
+                            else None
+                        ),
+                        'random_start': args.random_start,
+                        'attack_mask': point_mask,
+                        'attack_mask_stats': mask_stats,
+                        'loss_fn': loss_fn,
+                        'loss_stats': loss_stats,
+                    }
+                    if args.temporal_mode != 'none':
+                        attack_output = (
+                            radar_temporal_measurement_geometry_attack(
+                                temporal_data=temporal_data,
+                                temporal_mode=args.temporal_mode,
+                                point_scope=args.point_scope,
+                                **measurement_kwargs,
+                            )
+                        )
+                    else:
+                        attack_output = radar_measurement_geometry_attack(
+                            feature_names=feature_names,
+                            target_mask=target_mask,
+                            **measurement_kwargs,
+                        )
+                else:
+                    attack_output = point_cloud_attack(
+                        model=model,
+                        batch_dict=batch_dict,
+                        voxelizer=voxelizer,
+                        feature_names=feature_names,
+                        attack_type=args.attack_type,
+                        attack_feature=args.attack_feature,
+                        epsilon=args.epsilon,
+                        epsilon_overrides=epsilon_overrides,
+                        pgd_steps=args.pgd_steps,
+                        step_size=args.step_size,
+                        random_start=args.random_start,
+                        voxel_mode=args.voxel_mode,
+                        point_mask=point_mask,
+                        loss_fn=loss_fn,
+                        loss_stats=loss_stats,
+                    )
+                if target_context is not None:
+                    target_diagnostics = target_attack_diagnostics(
+                        target_context,
+                        attack_output.adv_points,
+                        attack_point_mask,
+                    )
             batch_dict['points'] = attack_output.adv_points
             batch_dict.update(attack_output.model_inputs)
             metrics.update_perturbation(attack_output.stats)
@@ -754,6 +1164,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 clean_evidence=clean_object_evidence,
                 adversarial_evidence=adversarial_object_evidence,
             )
+            if target_diagnostics is not None:
+                merge_target_diagnostics(
+                    endpoint_records, target_diagnostics
+                )
             metrics.update_object_endpoints(target_count, endpoint_records)
         progress_bar.update(len(pred_dicts_original))
 
@@ -785,6 +1199,22 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
         for class_id, threshold in object_iou_thresholds.items()
     }
     results['object_outcomes']['score_threshold'] = object_score_threshold
+    if metrics.object_endpoint_records and all(
+        'num_active_time0_points' in record
+        for record in metrics.object_endpoint_records
+    ):
+        results['current_sweep_summary'] = summarize_current_sweep(
+            metrics.object_endpoint_records
+        )
+        results['current_sweep_files'] = write_current_sweep_outputs(
+            metrics.object_endpoint_records, output_dir
+        )
+        results['target_correlations'] = target_correlations(
+            metrics.object_endpoint_records
+        )
+        results['target_correlation_file'] = write_correlation_output(
+            results['target_correlations'], output_dir
+        )
     object_endpoint_path = output_dir / 'object_endpoint_metrics.csv'
     metrics.write_object_endpoints(object_endpoint_path)
     results['object_endpoint_file'] = str(object_endpoint_path)
@@ -808,6 +1238,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     logger.info(f'Attack Type: {args.attack_type.upper()}')
     logger.info(f'Default Epsilon: {args.epsilon}')
     logger.info(f'Attack Feature: {args.attack_feature}')
+    logger.info(f'Attack Space: {args.attack_space}')
     if args.attack_domain == 'point' and args.attack_type != 'iadv':
         logger.info(f'Attack Loss: {args.attack_loss}')
         logger.info(f'Point Target Selection: {args.point_target_selection}')
@@ -824,17 +1255,97 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             if value is not None:
                 logger.info('Epsilon %s: %s', group, value)
         logger.info(f'Voxel Mode: {args.voxel_mode}')
+        if args.attack_space == 'radar_measurement':
+            logger.info('Temporal Mode: %s', args.temporal_mode)
+            logger.info(
+                'Measurement Sweep: %s',
+                {
+                    'none': 'current (time == 0)',
+                    'point_independent': (
+                        'all available, point-independent'
+                    ),
+                    'object_per_sweep': (
+                        'all available, object-shared within each sweep'
+                    ),
+                    'track_shared': 'all available, track-shared',
+                }[args.temporal_mode],
+            )
+            logger.info('Range Epsilon [m]: %s', args.epsilon_range)
+            logger.info(
+                'Azimuth / Elevation Epsilon [deg]: %s / %s',
+                args.epsilon_azimuth_deg,
+                args.epsilon_elevation_deg,
+            )
         logger.info(f'Max |delta|: {results["max_abs_perturbation"]:.6f}')
         logger.info(f'Mean |delta|: {results["mean_abs_perturbation"]:.6f}')
         if writer is not None:
             logger.info(f'Saved adversarial point clouds: {writer.saved_samples}')
             logger.info(f'Adversarial manifest: {writer.manifest_path}')
         diagnostics = results.get('attack_diagnostics', {})
+        if args.attack_space == 'radar_measurement':
+            if args.temporal_mode != 'none':
+                logger.info(
+                    'Temporal parameter groups (all / active): %d / %d',
+                    int(diagnostics.get('temporal_parameter_groups', 0.0)),
+                    int(diagnostics.get(
+                        'temporal_active_parameter_groups', 0.0
+                    )),
+                )
+            logger.info(
+                'Measurement max delta range [m] / azimuth [deg] / '
+                'elevation [deg]: %.6f / %.6f / %.6f',
+                diagnostics.get('measurement_max_abs_delta_range', 0.0),
+                math.degrees(diagnostics.get(
+                    'measurement_max_abs_delta_azimuth_rad', 0.0
+                )),
+                math.degrees(diagnostics.get(
+                    'measurement_max_abs_delta_elevation_rad', 0.0
+                )),
+            )
+            logger.info(
+                'Measurement Cartesian displacement max / mean L2 [m]: '
+                '%.6f / %.6f',
+                diagnostics.get('measurement_max_xyz_l2', 0.0),
+                diagnostics.get('measurement_mean_xyz_l2', 0.0),
+            )
+            logger.info(
+                'Measurement current active points / modified points: %d / %d',
+                int(diagnostics.get(
+                    'measurement_clean_active_current_target_points', 0.0
+                )),
+                int(diagnostics.get(
+                    'measurement_modified_current_points', 0.0
+                )),
+            )
+            logger.info(
+                'Measurement historical / non-target / non-geometry '
+                'modifications: %d / %d / %d',
+                int(diagnostics.get(
+                    'measurement_historical_modification_count', 0.0
+                )),
+                int(diagnostics.get(
+                    'measurement_non_target_modification_count', 0.0
+                )),
+                int(diagnostics.get(
+                    'measurement_non_geometry_modification_count', 0.0
+                )),
+            )
         if 'object_evidence_targets' in diagnostics:
             logger.info(
                 'Clean-detected attack targets: %d; mean candidates/target: %.1f',
                 int(diagnostics['object_evidence_targets']),
                 diagnostics['object_evidence_mean_candidates_per_target'],
+            )
+        if args.attack_loss == 'object_iou_s':
+            logger.info(
+                'Radar Object IoU-S targets: %d; mean candidates/target: %.1f; '
+                'score/IoU weights: %g/%g',
+                int(diagnostics.get('object_iou_s_targets', 0.0)),
+                diagnostics.get(
+                    'object_iou_s_mean_candidates_per_target', 0.0
+                ),
+                args.iou_s_score_weight,
+                args.iou_s_iou_weight,
             )
     logger.info(f'Total Samples: {results["total_samples"]}')
     logger.info(f'Original Recall@0.5: {results["original_recall"]:.4f}')
@@ -975,6 +1486,7 @@ def main():
     with open(output_dir / 'attack_results.json', 'w') as result_file:
         json.dump(result_payload, result_file, indent=2)
 
+    diagnostics = results.get('attack_diagnostics', {})
     with open(output_dir / 'attack_results.txt', 'w') as f:
         f.write('4D Radar Attack Results\n')
         f.write('=' * 40 + '\n')
@@ -982,6 +1494,7 @@ def main():
         f.write(f'Attack Type: {args.attack_type}\n')
         f.write(f'Default Epsilon: {args.epsilon}\n')
         f.write(f'Attack Feature: {args.attack_feature}\n')
+        f.write(f'Attack Space: {args.attack_space}\n')
         if args.attack_domain == 'point' and args.attack_type != 'iadv':
             f.write(f'Attack Loss: {args.attack_loss}\n')
             f.write(
@@ -1003,6 +1516,32 @@ def main():
                 if value is not None:
                     f.write(f'Epsilon {group}: {value}\n')
             f.write(f'Voxel Mode: {args.voxel_mode}\n')
+            if args.attack_space == 'radar_measurement':
+                f.write(f'Temporal Mode: {args.temporal_mode}\n')
+                f.write(
+                    'Measurement Sweep: '
+                    + {
+                        'none': 'current (time == 0)\n',
+                        'point_independent': (
+                            'all available, point-independent\n'
+                        ),
+                        'object_per_sweep': (
+                            'all available, object-shared within each sweep\n'
+                        ),
+                        'track_shared': 'all available, track-shared\n',
+                    }[args.temporal_mode]
+                )
+                f.write(f'Range Epsilon [m]: {args.epsilon_range}\n')
+                f.write(
+                    'Azimuth / Elevation Epsilon [deg]: '
+                    f'{args.epsilon_azimuth_deg} / '
+                    f'{args.epsilon_elevation_deg}\n'
+                )
+                f.write(
+                    'Temporal parameter groups (all / active): '
+                    f'{int(diagnostics.get("temporal_parameter_groups", 0.0))} / '
+                    f'{int(diagnostics.get("temporal_active_parameter_groups", 0.0))}\n'
+                )
         f.write(f'Total Samples: {results["total_samples"]}\n')
         f.write(f'Original Recall@0.5: {results["original_recall"]:.4f}\n')
         f.write(f'Attacked Recall@0.5: {results["attacked_recall"]:.4f}\n')
@@ -1062,6 +1601,28 @@ def main():
             f.write(f'Max |delta|: {results["max_abs_perturbation"]:.6f}\n')
             f.write(f'Mean |delta|: {results["mean_abs_perturbation"]:.6f}\n')
             diagnostics = results.get('attack_diagnostics', {})
+            if args.attack_space == 'radar_measurement':
+                f.write(
+                    'Measurement max delta range [m]: '
+                    f'{diagnostics.get("measurement_max_abs_delta_range", 0.0):.6f}\n'
+                )
+                f.write(
+                    'Measurement max delta azimuth / elevation [deg]: '
+                    f'{math.degrees(diagnostics.get("measurement_max_abs_delta_azimuth_rad", 0.0)):.6f} / '
+                    f'{math.degrees(diagnostics.get("measurement_max_abs_delta_elevation_rad", 0.0)):.6f}\n'
+                )
+                f.write(
+                    'Measurement Cartesian max / mean L2 [m]: '
+                    f'{diagnostics.get("measurement_max_xyz_l2", 0.0):.6f} / '
+                    f'{diagnostics.get("measurement_mean_xyz_l2", 0.0):.6f}\n'
+                )
+                f.write(
+                    'Measurement historical / non-target / non-geometry '
+                    'modifications: '
+                    f'{int(diagnostics.get("measurement_historical_modification_count", 0.0))} / '
+                    f'{int(diagnostics.get("measurement_non_target_modification_count", 0.0))} / '
+                    f'{int(diagnostics.get("measurement_non_geometry_modification_count", 0.0))}\n'
+                )
             if 'object_evidence_targets' in diagnostics:
                 f.write(
                     'Clean-detected attack targets: '
@@ -1070,6 +1631,19 @@ def main():
                 f.write(
                     'Mean candidates per target: '
                     f'{diagnostics["object_evidence_mean_candidates_per_target"]:.2f}\n'
+                )
+            if args.attack_loss == 'object_iou_s':
+                f.write(
+                    'Radar Object IoU-S targets: '
+                    f'{int(diagnostics.get("object_iou_s_targets", 0.0))}\n'
+                )
+                f.write(
+                    'Radar Object IoU-S mean candidates per target: '
+                    f'{diagnostics.get("object_iou_s_mean_candidates_per_target", 0.0):.2f}\n'
+                )
+                f.write(
+                    'Radar Object IoU-S score / IoU weights: '
+                    f'{args.iou_s_score_weight} / {args.iou_s_iou_weight}\n'
                 )
         if 'vod_official' in results:
             for area in ('entire_area', 'roi'):

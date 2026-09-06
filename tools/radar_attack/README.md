@@ -59,6 +59,260 @@ python tools/radar_attack/run_attack.py ...
 - `fixed`：攻击期间保持原始 pillar 分配，空间坐标不会跨越原 pillar 边界。梯度稳定，但限制更强。
 - `revoxelize`：每一步根据当前对抗点重新划分 pillar，并使用 BPDA/straight-through 特征聚合近似通过离散体素化反向传播。
 
+### Radar Measurement-Consistent Geometry Attack
+
+`--attack_space radar_measurement` 启用 Radar 测量参数化的对象级几何攻击。当前
+VoD Radar 坐标约定为 `x` 向前、`y` 向左、`z` 向上，内部使用：
+
+```text
+range     = sqrt(x^2 + y^2 + z^2)
+azimuth   = atan2(y, x)
+elevation = atan2(z, sqrt(x^2 + y^2))
+```
+
+PGD/FGSM 的主变量是 `range/azimuth/elevation`，而不是三个相互独立的
+Cartesian 坐标。每次迭代都会由更新后的测量值确定性重建 XYZ，再进行真实硬
+体素化并送入 PointPillars；离散 pillar 分配的反向传播仍使用现有 BPDA/
+straight-through 近似。
+
+第一版威胁模型为：
+
+```text
+Digital-domain, white-box, object-level attack.
+Only existing target points from the current Radar sweep are perturbed.
+Historical sweeps remain part of the five-frame detector input but are unchanged.
+```
+
+实际攻击 mask 是“目标框内点、`time == 0` 当前 sweep、clean 硬体素化实际保留
+的点”三者的交集。点数、点顺序、batch index、RCS、`v_r`、`v_r_comp` 和
+`time` 均保持不变。当前数据加载路径没有提供逐帧 ego-velocity 向量和可复现
+的官方 `v_r_comp` 计算，因此 angle 改变后暂时保留 clean `v_r_comp`，不自行
+猜测补偿公式。这意味着当前只保证几何测量参数化的一致性。
+
+第一版只支持：
+
+```text
+--attack_domain point
+--attack_feature xyz
+--point_scope gt_boxes
+--voxel_mode revoxelize
+```
+
+它不会独立裁剪重建后的 XYZ。若一个 measurement 更新使点越出 detector 的
+`POINT_CLOUD_RANGE`，程序会在 measurement space 中逐次减半该更新；仍无法
+得到合法点时回退到 clean measurement，从而避免破坏
+`xyz = T(range, azimuth, elevation)`。
+
+小规模工程 smoke test 示例：
+
+```bash
+python tools/radar_attack/run_attack.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt /absolute/path/to/checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_space radar_measurement \
+    --attack_type pgd \
+    --attack_feature xyz \
+    --point_scope gt_boxes \
+    --target_classes Car \
+    --point_target_selection all_gt \
+    --attack_loss training \
+    --epsilon_range 0.05 \
+    --epsilon_azimuth_deg 0.10 \
+    --epsilon_elevation_deg 0.10 \
+    --pgd_steps 2 \
+    --voxel_mode revoxelize \
+    --num_samples 2 \
+    --no_vod_eval \
+    --extra_tag measurement_geometry_smoke
+```
+
+角度配置和日志使用 degrees，内部优化统一转换为 radians。分别使用
+`--step_size_range`、`--step_size_azimuth_deg` 和
+`--step_size_elevation_deg` 可覆盖默认的 `2 * epsilon / pgd_steps`。上述预算
+只是用于代码验证的保守工程值，不是经过验证的传感器误差或物理攻击上限。
+
+结果会记录三个 measurement 最大扰动、Cartesian 最大/平均 L2 位移、距离分桶
+位移、当前 sweep 有效攻击点数、越界回退数，以及历史点、非目标点和非几何
+特征的修改数；后三类修改数必须为 0。
+
+这是 measurement-consistent digital geometry attack，不是 waveform/IQ-level
+攻击，也不能据此声称已经具有完整物理可实现性。
+
+#### 多 sweep 时序预处理
+
+`prepare_temporal.py` 为多 sweep measurement attack 恢复数据层元信息；三个
+非 `none` 的 `--temporal_mode` 都会在 FGSM/PGD 中使用这些信息：
+
+1. 将五帧文件中 `time=-k` 的点与 `frame_id-k` 的单帧 Radar 点按原始顺序
+   对齐；
+2. 由对应 XYZ 拟合 source Radar 到 reference Radar 的刚体变换，并缓存为
+   `.npz`；
+3. 在 source sweep 坐标系读取该帧 tracking GT 框，只保留 reference frame
+   中同一 tracking ID 的目标；
+4. 按归一化目标局部中心距离分配重叠框中的点；
+5. 验证 source XYZ → range/azimuth/elevation → source XYZ → reference XYZ
+   的零扰动往返误差，同时要求 RCS、Doppler、time 不变。
+
+运行完整验证集预处理：
+
+```bash
+/home/car/anaconda3/envs/openpcdet/bin/python \
+    tools/radar_attack/prepare_temporal.py \
+    --dataset_root data/view_of_delft \
+    --split val
+```
+
+快速检查可以增加 `--max_frames 10`。默认缓存和报告分别写入：
+
+```text
+output/radar_attack/temporal_sweep_cache/<frame_id>.npz
+output/radar_attack/temporal_sweep_cache/preparation_report.json
+```
+
+缓存加载时仍会重新核对 source/reference 点数、RCS/Doppler 顺序和刚体重建
+误差，因此数据或点顺序变化不会被静默接受。场景起始位置直接服从五帧文件中
+实际存在的 sweep id，不会越过 clip 边界补齐历史帧。
+
+当前阶段使用 tracking GT，符合现有白盒、GT-object 数字域威胁模型，但属于
+oracle object association。后续若研究更现实的攻击知识约束，需要将其替换为
+检测/跟踪关联。由于尚未耦合 Doppler 和几何，这一阶段应称为
+track-consistent multi-sweep measurement-space geometry attack，不能称为
+waveform 或完整物理 Radar 攻击。
+
+三种多 sweep 参数化使用完全相同的跟踪目标点、measurement 预算、loss、真实
+hard revoxelization 和坐标变换，只改变参数共享粒度：
+
+- `point_independent`：每个目标点独立使用一组
+  `[delta_range, delta_azimuth, delta_elevation]`；
+- `object_per_sweep`：同一 tracking ID 在同一个 sweep 内共享一组参数，不同
+  sweep 可以不同；
+- `track_shared`：同一 tracking ID 的所有可用 sweep 共享一组参数。
+
+measurement 更新在各点自己的 source Radar 坐标系完成，再通过缓存刚体变换
+返回 reference frame。若组内任一点越过 detector 范围，整个参数组共同回退：
+独立点模式只回退该点，object-per-sweep 回退该对象在该 sweep 的点，
+track-shared 回退整条轨迹。输出中的 `Temporal parameter groups` 可用于核对三种
+模式的实际自由度。
+
+`point_independent` 还支持 `--point_scope scene`，用于全场景 Cartesian
+压力测试的测量空间对照。该组合为每个 clean hard-voxel active 场景点分配独立
+measurement 参数；背景点没有对象或轨迹身份，因此 scene scope 不支持
+`object_per_sweep` 或 `track_shared`。对象级主实验仍应使用 `gt_boxes`。
+
+一帧、10 步 PGD 示例：
+
+```bash
+cd /home/car/OpenPCDet/tools
+/home/car/anaconda3/envs/openpcdet/bin/python \
+    radar_attack/run_attack.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt ../checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_space radar_measurement \
+    --temporal_mode track_shared \
+    --attack_type pgd \
+    --attack_feature xyz \
+    --point_scope gt_boxes \
+    --target_classes Car \
+    --point_target_selection all_gt \
+    --attack_loss training \
+    --epsilon_range 0.05 \
+    --epsilon_azimuth_deg 0.10 \
+    --epsilon_elevation_deg 0.10 \
+    --pgd_steps 10 \
+    --voxel_mode revoxelize \
+    --num_samples 1 \
+    --no_vod_eval \
+    --extra_tag temporal_track_shared_smoke
+```
+
+把示例中的 `track_shared` 分别替换为 `point_independent` 或
+`object_per_sweep` 即可运行另外两种模式。不提供非 `none` 的 temporal mode 时
+仍执行原来的 current-sweep measurement attack。三种多 sweep 模式都支持
+`training`、`object_evidence`、`object_hybrid` 和 `object_iou_s` loss；后三者仍要求
+`--point_target_selection clean_detected`。
+
+#### Radar Object IoU-S loss
+
+`--attack_loss object_iou_s` 是针对当前 Radar 对象级漏检任务接入的 IoU-S
+优化目标。它不会改变 measurement attack 的扰动变量、点掩码或重体素化流程，
+只替换用于求梯度的目标函数。对干净输入中检测成功的目标，先固定 GT 附近的
+pre-NMS anchors，并按干净 3D IoU（score 用于打破并列）保留前
+`--iou_s_candidate_topk` 个候选。每个候选的梯度上升目标为：
+
+```text
+L = w_score * log(1 - sigmoid(class_logit) + eps)
+  + w_iou   * log(1 - IoU3D(decoded_box, GT) + eps)
+```
+
+因此对 `L` 做梯度上升会同时降低目标类别置信度和预测框与 GT 的 3D IoU。
+默认 `w_score=w_iou=1`。候选先在每个目标内取平均；选择多类目标时，再按
+“同类目标平均、所选类别平均”聚合，Car 不会因为数量更多而支配 loss。
+
+OpenPCDet 自带 rotated-IoU CUDA overlap 只提供前向 BEV overlap，不能为 x/y/yaw
+提供完整梯度。本实现使用纯 PyTorch 的 yaw-aware 旋转矩形求交和高度交集；交集
+拓扑与顶点排序是离散的，但固定拓扑内对中心、尺寸和 yaw 分段可微。候选身份在
+clean forward 后保持不变，避免 PGD 过程中因 NMS 或候选切换导致优化目标漂移。
+
+这与论文官方代码动态使用 post-NMS proposals 的写法并不逐行相同，而是适配
+OpenPCDet PointPillars 和 Radar 测量空间的稳定实现。它仍是白盒、数字域的代理
+loss，不能单独证明物理可实现性。
+
+10 帧工程验证：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_radar_object_iou_s_smoke.yaml
+```
+
+该配置攻击 Car、Pedestrian、Cyclist 三类 clean-detected 对象，使用当前 sweep
+对象点、10 步 PGD、`range=0.5 m`、方位角/俯仰角各 `1 degree`，并执行真实
+revoxelization。预算沿用目前的研究性数字域实验设置，不代表已经验证的 Radar
+测量误差上限。核心参数也可直接在 `run_attack.py` 中设置：
+
+```text
+--attack_loss object_iou_s
+--iou_s_candidate_topk 32
+--iou_s_score_weight 1.0
+--iou_s_iou_weight 1.0
+--iou_s_log_epsilon 1e-6
+```
+
+#### Current-sweep 公平对照与 100 帧机制筛选
+
+`--current_sweep_only` 让 feature-space XYZ 攻击使用与 measurement
+attack 完全相同的点集合：clean-detected GT 目标点、`time == 0`、且被
+clean hard voxelization 保留。旧 five-sweep XYZ 行为仍然保留；只有显式
+加入该参数时才启用公平 current-sweep baseline。
+
+固定五组主实验加一个 displacement-matched XYZ 辅助点的 100 帧配置为：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_measurement_geometry_screen.yaml
+```
+
+它比较 `XYZ-current`、range-only、azimuth-only、elevation-only 和三个
+measurement 变量联合攻击。五组使用相同 uniform 子集、seed、training loss、
+10 步 PGD、确定性初始点和真实 hard revoxelization。当前 measurement 预算是
+`research/digital budget`，不是经过验证的物理传感器不确定性。
+
+每个实验另外输出：
+
+```text
+current_sweep_targets.csv
+current_sweep_summary.yaml
+current_sweep_summary.md
+object_endpoint_metrics.csv
+target_correlations.json
+```
+
+逐目标 CSV 包含总点数/current 点数/active current 点数、IoU/score/evidence
+变化、Cartesian 位移和真实 hard-pillar reassignment。campaign 根目录中的
+`comparison_summary.csv` 和 `comparison_summary.md` 是五种主攻击及一个辅助
+XYZ 预算的紧凑表格。
+
 ### 体素攻击
 
 使用 `--attack_domain voxel` 时，攻击变量是 OpenPCDet 已生成的 `voxels` 张量。这是用于比较的基线，不会产生可直接复用的原始对抗点云，也不支持 `--save_adv`。
@@ -502,6 +756,9 @@ python tools/radar_attack/run_experiments.py \
 | `--epsilon_rcs` | RCS/强度特征的最大绝对扰动 |
 | `--epsilon_doppler` | `v_r, v_r_comp` 的最大绝对扰动 |
 | `--epsilon_time` | 时间特征的最大绝对扰动 |
+| `--epsilon_range` | measurement attack 的距离预算，单位 m |
+| `--epsilon_azimuth_deg` | measurement attack 的方位角预算，单位 degree |
+| `--epsilon_elevation_deg` | measurement attack 的俯仰角预算，单位 degree |
 
 这些值作用在数据加载和特征编码后的数值上，单位跟随数据集中的对应特征。对当前 VoD 雷达配置，`xyz` 通常以米表示，速度和时间预算应根据实际数据定义与统计范围选择，不能直接把 `xyz` 的 epsilon 照搬给所有特征。
 
@@ -688,6 +945,10 @@ python tools/radar_attack/run_experiments.py \
 | `--target_classes` | `Car` | 可同时选择 Car、Pedestrian、Cyclist |
 | `--object_iou_thresholds` | `0.5/0.25/0.25` | 按类别设置 clean eligibility 与严格匹配阈值 |
 | `--object_score_threshold` | 模型后处理阈值 | 对象结果评估使用的预测分数下限 |
+| `--attack_loss` | `training` | 可选训练损失、对象证据、混合定位或 Radar Object IoU-S |
+| `--iou_s_candidate_topk` | `32` | 每个 IoU-S 目标固定保留的 clean 高 IoU 候选数 |
+| `--iou_s_score_weight` | `1.0` | IoU-S 置信度抑制项权重 |
+| `--iou_s_iou_weight` | `1.0` | IoU-S yaw-aware 3D IoU 抑制项权重 |
 | `--iadv_neighbor_scope` | `object` | I-ADV 的逐车、旧攻击点并集或全场景邻域/融合范围 |
 | `--save_adv` | 关闭 | 保存原始对抗点云，仅支持 point |
 | `--num_samples` | 全部 | 限制攻击样本数，用于调试 |
