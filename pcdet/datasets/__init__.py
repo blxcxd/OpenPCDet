@@ -13,6 +13,7 @@ from .pandaset.pandaset_dataset import PandasetDataset
 from .lyft.lyft_dataset import LyftDataset
 from .once.once_dataset import ONCEDataset
 from .custom.custom_dataset import CustomDataset
+from .vod_radar_dataset import VoDRadarDataset
 
 try:
     from .argo2.argo2_dataset import Argo2Dataset
@@ -29,6 +30,7 @@ __all__ = {
     'LyftDataset': LyftDataset,
     'ONCEDataset': ONCEDataset,
     'CustomDataset': CustomDataset,
+    'VoDRadarDataset': VoDRadarDataset,
 }
 
 if Argo2Dataset is not None:

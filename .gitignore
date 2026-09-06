@@ -8,6 +8,8 @@ venv/
 *.idea/
 *.so
 *.yaml
+!tools/cfgs/kitti_models/radarpillars.yaml
+!tools/radar_attack/configs/vod_measurement_geometry_screen.yaml
 !tools/radar_attack/configs/vod_point_baseline_screen.yaml
 !tools/radar_attack/configs/vod_iadv_rcs_screen.yaml
 !tools/radar_attack/configs/vod_iadv_rcs_object_fidelity.yaml
@@ -16,6 +18,7 @@ venv/
 !tools/radar_attack/configs/vod_object_loss_ablation.yaml
 !tools/radar_attack/configs/vod_object_endpoint_ablation.yaml
 !tools/radar_attack/configs/vod_object_hybrid_ablation.yaml
+!tools/radar_attack/configs/vod_radar_object_iou_s_smoke.yaml
 *.sh
 *.pth
 *.pkl
