@@ -16,6 +16,7 @@ from .iou_s_original import (
     directed_chamfer_squared,
     original_iou_s_detection_loss,
     original_iou_s_point_attack,
+    prediction_set_retention,
     symmetric_chamfer_squared,
 )
 from .measurement import (
@@ -68,6 +69,7 @@ __all__ = [
     'symmetric_chamfer_squared',
     'original_iou_s_detection_loss',
     'original_iou_s_point_attack',
+    'prediction_set_retention',
     'build_measurement_attack_mask',
     'TEMPORAL_PARAMETER_MODES',
     'build_temporal_measurement_attack_mask',

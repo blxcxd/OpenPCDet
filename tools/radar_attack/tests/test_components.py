@@ -27,6 +27,7 @@ from tools.radar_attack.attacks import (
     iadv_rcs_attack,
     original_iou_s_detection_loss,
     original_iou_s_point_attack,
+    prediction_set_retention,
     point_cloud_attack,
     points_in_oriented_boxes,
     project_radar_measurements,
@@ -409,6 +410,26 @@ class RadarAttackComponentTest(unittest.TestCase):
 
         self.assertAlmostEqual(distance.item(), 18.0)
 
+    def test_prediction_set_retention_detects_replacement(self):
+        previous = {
+            'pred_boxes': torch.tensor([
+                [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+                [4.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+            ]),
+            'pred_labels': torch.tensor([1, 2]),
+        }
+        current = {
+            'pred_boxes': torch.tensor([
+                [0.1, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+                [8.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+            ]),
+            'pred_labels': torch.tensor([1, 2]),
+        }
+
+        retention = prediction_set_retention(previous, current)
+
+        self.assertAlmostEqual(retention, 0.5)
+
     def test_original_iou_s_attack_is_full_scene_xyz_only(self):
         points = torch.tensor([
             [0.0, 0.5, 0.5, 0.5, 4.0, 0.2, 0.1, 0.0],
@@ -450,6 +471,28 @@ class RadarAttackComponentTest(unittest.TestCase):
             output.stats['iou_s_original_hard_epsilon_projection'], 0.0
         )
         self.assertEqual(output.stats['iou_s_original_steps'], 2.0)
+        self.assertGreaterEqual(output.stats['iou_s_original_best_step'], 1.0)
+        self.assertLessEqual(output.stats['iou_s_original_best_step'], 2.0)
+        self.assertIn(
+            'iou_s_original_mean_prediction_retention', output.stats
+        )
+
+        last_output = original_iou_s_point_attack(
+            model=model,
+            batch_dict={
+                'points': points,
+                'gt_boxes': gt_boxes,
+                'batch_size': 1,
+            },
+            voxelizer=voxelizer,
+            steps=2,
+            learning_rate=0.01,
+            initial_noise=0.001,
+            chamfer_chunk_size=1,
+            return_policy='last',
+        )
+        self.assertEqual(last_output.stats['iou_s_original_return_last'], 1.0)
+        self.assertTrue(torch.equal(last_output.adv_points[:, 4:], points[:, 4:]))
 
     def test_radar_measurement_cartesian_round_trip(self):
         xyz = torch.tensor(

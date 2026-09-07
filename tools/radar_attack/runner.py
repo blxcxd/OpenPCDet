@@ -323,6 +323,15 @@ def parse_config():
     parser.add_argument('--iou_s_original_chamfer_chunk_size', type=int,
                         default=1024,
                         help='point chunk size for exact Chamfer computation')
+    parser.add_argument(
+        '--iou_s_original_return_policy',
+        choices=['joint_best', 'last'],
+        default='joint_best',
+        help=(
+            'returned IoU-S iterate: official joint distance/total best, '
+            'or the final Adam iterate for diagnosis'
+        ),
+    )
     parser.add_argument('--iadv_steps', type=int, default=10,
                         help='I-ADV iteration count')
     parser.add_argument('--iadv_scope', choices=['gt_boxes', 'scene'],
@@ -855,6 +864,9 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'iou_s_original_chamfer_chunk_size': (
                         args.iou_s_original_chamfer_chunk_size
                     ),
+                    'iou_s_original_return_policy': (
+                        args.iou_s_original_return_policy
+                    ),
                     'iadv_steps': args.iadv_steps,
                     'iadv_scope': args.iadv_scope,
                     'iadv_neighbor_scope': args.iadv_neighbor_scope,
@@ -963,6 +975,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     chamfer_chunk_size=(
                         args.iou_s_original_chamfer_chunk_size
                     ),
+                    return_policy=args.iou_s_original_return_policy,
                 )
             else:
                 point_mask = None
@@ -1337,7 +1350,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     logger.info('Attack Results for 4D Radar Data:')
     logger.info(f'Attack Domain: {args.attack_domain}')
     logger.info(f'Attack Type: {args.attack_type.upper()}')
-    logger.info(f'Default Epsilon: {args.epsilon}')
+    if args.attack_type == 'iou_s_original':
+        logger.info('Default Epsilon: unused (no hard projection)')
+    else:
+        logger.info(f'Default Epsilon: {args.epsilon}')
     logger.info(f'Attack Feature: {args.attack_feature}')
     logger.info(f'Attack Space: {args.attack_space}')
     if args.attack_domain == 'point' and args.attack_type not in {
@@ -1362,6 +1378,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
         )
         logger.info('Original IoU-S Point Scope: full scene')
         logger.info('Original IoU-S Hard Epsilon Projection: disabled')
+        logger.info(
+            'Original IoU-S Return Policy: %s',
+            args.iou_s_original_return_policy,
+        )
         logger.info(
             'Original IoU-S evaluation target classes: %s',
             ', '.join(target_class_names),
@@ -1479,6 +1499,37 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 diagnostics.get('iou_s_original_best_attack_loss', 0.0),
                 diagnostics.get('iou_s_original_best_distance_loss', 0.0),
                 diagnostics.get('iou_s_original_best_total_loss', 0.0),
+            )
+            logger.info(
+                'Original IoU-S mean best step / early <=10 / early <=100: '
+                '%.1f / %.3f / %.3f',
+                diagnostics.get('iou_s_original_best_step', 0.0),
+                diagnostics.get('iou_s_original_best_step_le_10', 0.0),
+                diagnostics.get('iou_s_original_best_step_le_100', 0.0),
+            )
+            logger.info(
+                'Original IoU-S actual joint-best / last attack loss per pair: '
+                '%.6f / %.6f',
+                diagnostics.get(
+                    'iou_s_original_joint_best_endpoint_attack_loss_per_pair',
+                    0.0,
+                ),
+                diagnostics.get(
+                    'iou_s_original_last_attack_loss_per_pair', 0.0
+                ),
+            )
+            logger.info(
+                'Original IoU-S prediction retention / switch / count-change '
+                'fractions: %.3f / %.3f / %.3f',
+                diagnostics.get(
+                    'iou_s_original_mean_prediction_retention', 0.0
+                ),
+                diagnostics.get(
+                    'iou_s_original_prediction_switch_fraction', 0.0
+                ),
+                diagnostics.get(
+                    'iou_s_original_prediction_count_change_fraction', 0.0
+                ),
             )
     logger.info(f'Total Samples: {results["total_samples"]}')
     logger.info(f'Original Recall@0.5: {results["original_recall"]:.4f}')
@@ -1625,7 +1676,10 @@ def main():
         f.write('=' * 40 + '\n')
         f.write(f'Attack Domain: {args.attack_domain}\n')
         f.write(f'Attack Type: {args.attack_type}\n')
-        f.write(f'Default Epsilon: {args.epsilon}\n')
+        if args.attack_type == 'iou_s_original':
+            f.write('Default Epsilon: unused (no hard projection)\n')
+        else:
+            f.write(f'Default Epsilon: {args.epsilon}\n')
         f.write(f'Attack Feature: {args.attack_feature}\n')
         f.write(f'Attack Space: {args.attack_space}\n')
         if args.attack_domain == 'point' and args.attack_type not in {
@@ -1660,6 +1714,10 @@ def main():
             )
             f.write('Original IoU-S Point Scope: full scene\n')
             f.write('Original IoU-S Hard Epsilon Projection: disabled\n')
+            f.write(
+                'Original IoU-S Return Policy: '
+                f'{args.iou_s_original_return_policy}\n'
+            )
         if args.attack_domain == 'point':
             for group in ('xyz', 'rcs', 'doppler', 'time'):
                 value = getattr(args, f'epsilon_{group}')

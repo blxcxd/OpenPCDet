@@ -1,0 +1,35 @@
+version: 1
+name: vod_iou_s_original_last_screen
+
+# Diagnostic paired with vod_iou_s_original_screen.  The Adam trajectory and
+# loss are unchanged; only the returned candidate is the final iterate instead
+# of the official joint distance/total best.  Use the same seed and uniformly
+# selected 100 frames for a direct endpoint comparison.
+common:
+  cfg_file: cfgs/kitti_models/pointpillar_radar.yaml
+  ckpt: checkpoint_epoch_80.pth
+  batch_size: 1
+  workers: 4
+  seed: 1024
+  attack_domain: point
+  attack_type: iou_s_original
+  attack_feature: xyz
+  attack_space: feature
+  voxel_mode: revoxelize
+  point_scope: scene
+  point_target_selection: all_gt
+  target_classes: [Car, Pedestrian, Cyclist]
+  object_iou_thresholds: [Car=0.5, Pedestrian=0.25, Cyclist=0.25]
+  iou_s_original_steps: 500
+  iou_s_original_lr: 0.01
+  iou_s_original_init_noise: 0.01
+  iou_s_original_distance_weight: 1.0
+  iou_s_original_log_epsilon: 0.00000001
+  iou_s_original_chamfer_chunk_size: 1024
+  iou_s_original_return_policy: last
+  num_samples: 100
+  sample_strategy: uniform
+  no_vod_eval: true
+
+experiments:
+  - name: iou_s_final_adam_iterate

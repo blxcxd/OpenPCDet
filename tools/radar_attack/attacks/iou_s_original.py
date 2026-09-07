@@ -111,6 +111,70 @@ def original_iou_s_detection_loss(
     return loss, pair_count
 
 
+def prediction_set_retention(
+    previous: Dict[str, torch.Tensor],
+    current: Dict[str, torch.Tensor],
+    iou_threshold: float = 0.5,
+) -> float:
+    """Fraction of the larger post-NMS set retained across two iterations.
+
+    A prediction is retained when it has a same-class box in the other set
+    with oriented 3D IoU at least ``iou_threshold``.  Dividing the number of
+    one-to-one greedy matches by the larger set size makes both disappearing
+    and newly appearing boxes reduce the score.  This is a detached diagnostic
+    only and never contributes to the attack gradient.
+    """
+    if not 0 <= iou_threshold <= 1:
+        raise ValueError('iou_threshold must be in [0, 1]')
+    previous_boxes = previous['pred_boxes'][:, :7].detach()
+    current_boxes = current['pred_boxes'][:, :7].detach()
+    previous_labels = previous['pred_labels'].detach().long()
+    current_labels = current['pred_labels'].detach().long()
+    previous_count = int(previous_boxes.shape[0])
+    current_count = int(current_boxes.shape[0])
+    denominator = max(previous_count, current_count)
+    if denominator == 0:
+        return 1.0
+    if previous_count == 0 or current_count == 0:
+        return 0.0
+
+    paired_previous = previous_boxes[:, None, :].expand(
+        previous_count, current_count, 7
+    ).reshape(-1, 7)
+    paired_current = current_boxes[None, :, :].expand(
+        previous_count, current_count, 7
+    ).reshape(-1, 7)
+    pair_ious = differentiable_oriented_iou3d(
+        paired_previous, paired_current
+    ).reshape(previous_count, current_count)
+    same_class = previous_labels[:, None] == current_labels[None, :]
+    pair_ious = torch.where(same_class, pair_ious, pair_ious.new_zeros(()))
+
+    matches = 0
+    available_previous = torch.ones(
+        previous_count, dtype=torch.bool, device=pair_ious.device
+    )
+    available_current = torch.ones(
+        current_count, dtype=torch.bool, device=pair_ious.device
+    )
+    # The post-NMS sets are small.  A detached greedy assignment is enough for
+    # a stable diagnostic and avoids adding a SciPy dependency to the attack.
+    for _ in range(min(previous_count, current_count)):
+        available = available_previous[:, None] & available_current[None, :]
+        candidates = torch.where(
+            available, pair_ious, pair_ious.new_full((), -1.0)
+        )
+        best_value, flat_index = candidates.reshape(-1).max(dim=0)
+        if float(best_value.item()) < float(iou_threshold):
+            break
+        previous_index = int(flat_index.item()) // current_count
+        current_index = int(flat_index.item()) % current_count
+        available_previous[previous_index] = False
+        available_current[current_index] = False
+        matches += 1
+    return matches / denominator
+
+
 def original_iou_s_point_attack(
     model: torch.nn.Module,
     batch_dict: Dict,
@@ -121,6 +185,7 @@ def original_iou_s_point_attack(
     distance_weight: float = 1.0,
     log_epsilon: float = 1e-8,
     chamfer_chunk_size: int = 1024,
+    return_policy: str = 'joint_best',
 ) -> AttackOutput:
     """Port the official IoU-S full-scene XYZ perturbation attack.
 
@@ -143,6 +208,8 @@ def original_iou_s_point_attack(
         raise ValueError('log_epsilon must be in (0, 1)')
     if chamfer_chunk_size <= 0:
         raise ValueError('chamfer_chunk_size must be positive')
+    if return_policy not in {'joint_best', 'last'}:
+        raise ValueError('return_policy must be joint_best or last')
 
     original = batch_dict['points'].detach().clone()
     if original.ndim != 2 or original.shape[1] < 4:
@@ -165,14 +232,23 @@ def original_iou_s_point_attack(
     best_distance = float('inf')
     best_total = float('inf')
     best_attack = float('inf')
-    last_distance = 0.0
-    last_attack = 0.0
+    best_step = 0
+    best_updates = 0
+    first_distance = 0.0
+    first_attack = 0.0
+    first_total = 0.0
     prediction_total = 0
     pair_total = 0
     nonfinite_steps = 0
+    zero_prediction_steps = 0
+    transition_count = 0
+    retention_sum = 0.0
+    switch_count = 0
+    prediction_count_change_count = 0
+    previous_predictions = None
 
     try:
-        for _ in range(steps):
+        for step_index in range(steps):
             adversarial = original.clone()
             adversarial[:, 1:4] = xyz
             topology = voxelizer.topology(adversarial)
@@ -187,6 +263,22 @@ def original_iou_s_point_attack(
             attack_loss, pair_count = original_iou_s_detection_loss(
                 predictions[0], batch_dict['gt_boxes'][0], log_epsilon
             )
+            current_predictions = {
+                'pred_boxes': predictions[0]['pred_boxes'].detach(),
+                'pred_labels': predictions[0]['pred_labels'].detach(),
+            }
+            if previous_predictions is not None:
+                retention = prediction_set_retention(
+                    previous_predictions, current_predictions
+                )
+                retention_sum += retention
+                transition_count += 1
+                if retention < 1.0:
+                    switch_count += 1
+                if (previous_predictions['pred_boxes'].shape[0]
+                        != current_predictions['pred_boxes'].shape[0]):
+                    prediction_count_change_count += 1
+            previous_predictions = current_predictions
             chamfer = symmetric_chamfer_squared(
                 xyz, original[:, 1:4], chunk_size=chamfer_chunk_size
             )
@@ -209,20 +301,68 @@ def original_iou_s_point_attack(
             total_value = float(total_loss.detach().item())
             prediction_total += int(predictions[0]['pred_boxes'].shape[0])
             pair_total += pair_count
-            last_distance = distance_value
-            last_attack = attack_value
+            if predictions[0]['pred_boxes'].shape[0] == 0:
+                zero_prediction_steps += 1
+            if step_index == 0:
+                first_distance = distance_value
+                first_attack = attack_value
+                first_total = total_value
             # Preserve the reference implementation's joint improvement rule.
             if distance_value < best_distance and total_value < best_total:
                 best_distance = distance_value
                 best_total = total_value
                 best_attack = attack_value
+                best_step = step_index + 1
+                best_updates += 1
                 best_points = original.clone()
                 best_points[:, 1:4] = xyz.detach()
+
+        last_points = original.clone()
+        last_points[:, 1:4] = xyz.detach()
+
+        def endpoint_losses(points: torch.Tensor) -> tuple[float, float, float, int]:
+            endpoint_topology = voxelizer.topology(points)
+            endpoint_voxels = voxelizer.materialize(points, endpoint_topology)
+            endpoint_batch = dict(batch_dict)
+            endpoint_batch['points'] = points
+            endpoint_batch.update(endpoint_voxels)
+            with torch.no_grad():
+                endpoint_predictions, _ = model(endpoint_batch)
+                endpoint_attack, endpoint_pairs = original_iou_s_detection_loss(
+                    endpoint_predictions[0], batch_dict['gt_boxes'][0], log_epsilon
+                )
+                endpoint_chamfer = symmetric_chamfer_squared(
+                    points[:, 1:4], original[:, 1:4],
+                    chunk_size=chamfer_chunk_size,
+                )
+                endpoint_global_l2 = torch.sqrt(
+                    (points[:, 1:4] - original[:, 1:4]).square().sum()
+                    + 1e-4
+                )
+                endpoint_distance = endpoint_chamfer + endpoint_global_l2
+                endpoint_total = (
+                    endpoint_attack
+                    + float(distance_weight) * endpoint_distance
+                )
+            return (
+                float(endpoint_attack.item()),
+                float(endpoint_distance.item()),
+                float(endpoint_total.item()),
+                int(endpoint_pairs),
+            )
+
+        joint_best_endpoint = endpoint_losses(best_points)
+        last_endpoint = endpoint_losses(last_points)
     finally:
         restore_attack_modes(model_states)
         model.zero_grad(set_to_none=True)
 
-    adversarial = best_points.detach()
+    selected_endpoint = (
+        joint_best_endpoint if return_policy == 'joint_best' else last_endpoint
+    )
+    adversarial = (
+        best_points if return_policy == 'joint_best' else last_points
+    ).detach()
     final_topology = voxelizer.topology(adversarial)
     voxel_data = voxelizer.materialize(adversarial, final_topology)
     delta_xyz = adversarial[:, 1:4] - original[:, 1:4]
@@ -253,8 +393,42 @@ def original_iou_s_point_attack(
         'iou_s_original_best_attack_loss': best_attack,
         'iou_s_original_best_distance_loss': best_distance,
         'iou_s_original_best_total_loss': best_total,
-        'iou_s_original_last_attack_loss': last_attack,
-        'iou_s_original_last_distance_loss': last_distance,
+        'iou_s_original_best_step': float(best_step),
+        'iou_s_original_best_step_fraction': best_step / steps,
+        'iou_s_original_best_updates': float(best_updates),
+        'iou_s_original_best_step_le_10': float(best_step <= 10),
+        'iou_s_original_best_step_le_100': float(best_step <= 100),
+        'iou_s_original_first_attack_loss': first_attack,
+        'iou_s_original_first_distance_loss': first_distance,
+        'iou_s_original_first_total_loss': first_total,
+        'iou_s_original_joint_best_endpoint_attack_loss': joint_best_endpoint[0],
+        'iou_s_original_joint_best_endpoint_distance_loss': joint_best_endpoint[1],
+        'iou_s_original_joint_best_endpoint_total_loss': joint_best_endpoint[2],
+        'iou_s_original_last_attack_loss': last_endpoint[0],
+        'iou_s_original_last_distance_loss': last_endpoint[1],
+        'iou_s_original_last_total_loss': last_endpoint[2],
+        'iou_s_original_selected_attack_loss': selected_endpoint[0],
+        'iou_s_original_selected_distance_loss': selected_endpoint[1],
+        'iou_s_original_selected_total_loss': selected_endpoint[2],
+        'iou_s_original_joint_best_endpoint_attack_loss_per_pair': (
+            joint_best_endpoint[0] / max(joint_best_endpoint[3], 1)
+        ),
+        'iou_s_original_last_attack_loss_per_pair': (
+            last_endpoint[0] / max(last_endpoint[3], 1)
+        ),
+        'iou_s_original_mean_prediction_retention': (
+            retention_sum / max(transition_count, 1)
+        ),
+        'iou_s_original_prediction_switch_fraction': (
+            switch_count / max(transition_count, 1)
+        ),
+        'iou_s_original_prediction_count_change_fraction': (
+            prediction_count_change_count / max(transition_count, 1)
+        ),
+        'iou_s_original_zero_prediction_step_fraction': (
+            zero_prediction_steps / steps
+        ),
+        'iou_s_original_return_last': float(return_policy == 'last'),
         'iou_s_original_nonfinite_gradient_steps': float(nonfinite_steps),
         'iou_s_original_hard_epsilon_projection': 0.0,
     }

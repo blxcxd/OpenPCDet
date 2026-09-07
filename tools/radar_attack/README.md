@@ -258,6 +258,18 @@ python tools/radar_attack/run_experiments.py \
     tools/radar_attack/configs/vod_iou_s_original_screen.yaml
 ```
 
+为诊断原论文的联合最优样本保存规则，可在同一批 100 帧上返回第 500
+步 Adam 结果。该配置不改变优化轨迹或损失，只把返回策略从默认的
+`joint_best` 改为 `last`：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_iou_s_original_last_screen.yaml
+```
+
+诊断输出同时报告平均最佳步骤、前 10/100 步内选中比例、联合最优与最后
+一步的每对预测损失，以及相邻迭代后处理框的保持率、切换率和数量变化率。
+
 筛选稳定后运行完整 1296 帧和 VoD 官方 AP：
 
 ```bash

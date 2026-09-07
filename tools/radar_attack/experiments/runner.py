@@ -60,6 +60,7 @@ VALUE_OPTIONS = (
     'iou_s_original_distance_weight',
     'iou_s_original_log_epsilon',
     'iou_s_original_chamfer_chunk_size',
+    'iou_s_original_return_policy',
     'object_loss_iou_threshold',
     'object_loss_candidate_margin',
     'object_loss_candidate_topk',
@@ -137,6 +138,7 @@ SUMMARY_COLUMNS = (
     'iou_s_original_lr',
     'iou_s_original_init_noise',
     'iou_s_original_distance_weight',
+    'iou_s_original_return_policy',
     'seed',
     'total_samples',
     'original_recall',
@@ -191,6 +193,15 @@ SUMMARY_COLUMNS = (
     'iou_s_original_best_attack_loss',
     'iou_s_original_best_distance_loss',
     'iou_s_original_best_total_loss',
+    'iou_s_original_best_step',
+    'iou_s_original_best_step_le_10',
+    'iou_s_original_best_step_le_100',
+    'iou_s_original_joint_best_endpoint_attack_loss_per_pair',
+    'iou_s_original_last_attack_loss_per_pair',
+    'iou_s_original_mean_prediction_retention',
+    'iou_s_original_prediction_switch_fraction',
+    'iou_s_original_prediction_count_change_fraction',
+    'iou_s_original_zero_prediction_step_fraction',
     'iou_s_original_nonfinite_gradient_steps',
     'iadv_valid_targets',
     'iadv_mean_points_per_target',
@@ -502,7 +513,10 @@ def result_to_row(
         'attack_feature': attack.get('attack_feature'),
         'attack_space': attack.get('attack_space', 'feature'),
         'temporal_mode': attack.get('temporal_mode', 'none'),
-        'epsilon_default': attack.get('epsilon'),
+        'epsilon_default': (
+            None if attack.get('attack_type') == 'iou_s_original'
+            else attack.get('epsilon')
+        ),
         'epsilon_xyz': attack.get('epsilon_xyz'),
         'epsilon_rcs': attack.get('epsilon_rcs'),
         'epsilon_doppler': attack.get('epsilon_doppler'),
@@ -545,6 +559,9 @@ def result_to_row(
         ),
         'iou_s_original_distance_weight': attack.get(
             'iou_s_original_distance_weight'
+        ),
+        'iou_s_original_return_policy': attack.get(
+            'iou_s_original_return_policy'
         ),
         'seed': attack.get('seed'),
         'total_samples': metrics.get('total_samples'),
@@ -672,6 +689,35 @@ def result_to_row(
         ),
         'iou_s_original_best_total_loss': diagnostics.get(
             'iou_s_original_best_total_loss'
+        ),
+        'iou_s_original_best_step': diagnostics.get(
+            'iou_s_original_best_step'
+        ),
+        'iou_s_original_best_step_le_10': diagnostics.get(
+            'iou_s_original_best_step_le_10'
+        ),
+        'iou_s_original_best_step_le_100': diagnostics.get(
+            'iou_s_original_best_step_le_100'
+        ),
+        'iou_s_original_joint_best_endpoint_attack_loss_per_pair': (
+            diagnostics.get(
+                'iou_s_original_joint_best_endpoint_attack_loss_per_pair'
+            )
+        ),
+        'iou_s_original_last_attack_loss_per_pair': diagnostics.get(
+            'iou_s_original_last_attack_loss_per_pair'
+        ),
+        'iou_s_original_mean_prediction_retention': diagnostics.get(
+            'iou_s_original_mean_prediction_retention'
+        ),
+        'iou_s_original_prediction_switch_fraction': diagnostics.get(
+            'iou_s_original_prediction_switch_fraction'
+        ),
+        'iou_s_original_prediction_count_change_fraction': diagnostics.get(
+            'iou_s_original_prediction_count_change_fraction'
+        ),
+        'iou_s_original_zero_prediction_step_fraction': diagnostics.get(
+            'iou_s_original_zero_prediction_step_fraction'
         ),
         'iou_s_original_nonfinite_gradient_steps': diagnostics.get(
             'iou_s_original_nonfinite_gradient_steps'

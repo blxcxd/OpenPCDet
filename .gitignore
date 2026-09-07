@@ -21,6 +21,7 @@ venv/
 !tools/radar_attack/configs/vod_radar_object_iou_s_smoke.yaml
 !tools/radar_attack/configs/vod_iou_s_original_screen.yaml
 !tools/radar_attack/configs/vod_iou_s_original_full.yaml
+!tools/radar_attack/configs/vod_iou_s_original_last_screen.yaml
 *.sh
 *.pth
 *.pkl
