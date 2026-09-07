@@ -12,6 +12,12 @@ from .iadv import (
     points_in_oriented_boxes,
     rcs_column,
 )
+from .iou_s_original import (
+    directed_chamfer_squared,
+    original_iou_s_detection_loss,
+    original_iou_s_point_attack,
+    symmetric_chamfer_squared,
+)
 from .measurement import (
     TEMPORAL_PARAMETER_MODES,
     build_measurement_attack_mask,
@@ -58,6 +64,10 @@ __all__ = [
     'radar_object_iou_s',
     'points_in_oriented_boxes',
     'rcs_column',
+    'directed_chamfer_squared',
+    'symmetric_chamfer_squared',
+    'original_iou_s_detection_loss',
+    'original_iou_s_point_attack',
     'build_measurement_attack_mask',
     'TEMPORAL_PARAMETER_MODES',
     'build_temporal_measurement_attack_mask',

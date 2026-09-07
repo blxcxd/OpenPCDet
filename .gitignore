@@ -19,6 +19,8 @@ venv/
 !tools/radar_attack/configs/vod_object_endpoint_ablation.yaml
 !tools/radar_attack/configs/vod_object_hybrid_ablation.yaml
 !tools/radar_attack/configs/vod_radar_object_iou_s_smoke.yaml
+!tools/radar_attack/configs/vod_iou_s_original_screen.yaml
+!tools/radar_attack/configs/vod_iou_s_original_full.yaml
 *.sh
 *.pth
 *.pkl

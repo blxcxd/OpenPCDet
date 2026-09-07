@@ -233,7 +233,69 @@ cd /home/car/OpenPCDet/tools
 `training`、`object_evidence`、`object_hybrid` 和 `object_iou_s` loss；后三者仍要求
 `--point_target_selection clean_detected`。
 
-#### Radar Object IoU-S loss
+#### IoU-S 原论文实验线 A：全场景 point perturbation
+
+`--attack_type iou_s_original` 独立复现作者公开代码中的 `iou_per` 分支，不能与
+下面的 Radar 对象级适配 loss 混称。默认行为与公开实现对齐：
+
+- 整帧所有点均可修改，但严格保持点数、顺序和非 XYZ 特征不变；
+- 每一步真实重体素化，并动态使用当前 post-NMS 预测框和分数；
+- 每个有效 GT 与每个当前预测组成一对，最小化
+  `-log(1-score)-log(1-IoU3D)` 的总和，不按类别筛选或均衡；
+- 使用 Adam，默认 500 步、学习率 `0.01`、正向均匀 XYZ 初始噪声 `0.01`；
+- 距离项是双向 squared Chamfer 与全局 XYZ L2 之和，默认权重为 1；
+- 不使用 GT 框点掩码，也不执行逐点 epsilon 硬投影。
+
+OpenPCDet 的 hard voxel assignment 仍是离散操作；每一步按当前 XYZ 重建
+topology，梯度通过实际进入 voxel 的 point gather 回传。旋转 3D IoU 使用本目录
+已有的分段可微 PyTorch 实现。`--target_classes` 只决定最终 Object Failure ASR
+评估哪些类别，不会限制原始 IoU-S loss 中参与优化的 GT 类别。
+
+100 帧论文参数筛选：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_iou_s_original_screen.yaml
+```
+
+筛选稳定后运行完整 1296 帧和 VoD 官方 AP：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_iou_s_original_full.yaml
+```
+
+直接命令形式：
+
+```bash
+python tools/radar_attack/run_attack.py \
+    --cfg_file cfgs/kitti_models/pointpillar_radar.yaml \
+    --ckpt /absolute/path/to/checkpoint_epoch_80.pth \
+    --attack_domain point \
+    --attack_type iou_s_original \
+    --attack_feature xyz \
+    --attack_space feature \
+    --voxel_mode revoxelize \
+    --point_scope scene \
+    --point_target_selection all_gt \
+    --target_classes Car Pedestrian Cyclist \
+    --iou_s_original_steps 500 \
+    --iou_s_original_lr 0.01 \
+    --iou_s_original_init_noise 0.01 \
+    --iou_s_original_distance_weight 1.0 \
+    --iou_s_original_log_epsilon 1e-8 \
+    --iou_s_original_chamfer_chunk_size 1024 \
+    --num_samples 100 \
+    --sample_strategy uniform \
+    --no_vod_eval \
+    --extra_tag iou_s_original_screen
+```
+
+这里的通用 `--epsilon` 和 `--pgd_steps` 不参与攻击。实际扰动代价由输出中的
+最大/平均 XYZ 位移、Chamfer/L2 距离和修改点数审计。参考实现：
+[haichen-ber/IoU-S-Attack](https://github.com/haichen-ber/IoU-S-Attack)。
+
+#### Radar Object IoU-S loss（适配实验线，非原论文复现）
 
 `--attack_loss object_iou_s` 是针对当前 Radar 对象级漏检任务接入的 IoU-S
 优化目标。它不会改变 measurement attack 的扰动变量、点掩码或重体素化流程，
@@ -935,7 +997,7 @@ python tools/radar_attack/run_experiments.py \
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--attack_domain` | `voxel` | `point` 为原始点云攻击，`voxel` 为体素基线 |
-| `--attack_type` | `fgsm` | `fgsm`、`pgd` 或仅用于原始点云 RCS 的 `iadv` |
+| `--attack_type` | `fgsm` | `fgsm`、`pgd`、`iadv` 或全场景原版 `iou_s_original` |
 | `--attack_feature` | `all` | 选择被攻击的语义特征组 |
 | `--epsilon` | `0.05` | 统一扰动预算或分组预算的回退值 |
 | `--pgd_steps` | `5` | PGD 迭代次数 |
@@ -949,6 +1011,10 @@ python tools/radar_attack/run_experiments.py \
 | `--iou_s_candidate_topk` | `32` | 每个 IoU-S 目标固定保留的 clean 高 IoU 候选数 |
 | `--iou_s_score_weight` | `1.0` | IoU-S 置信度抑制项权重 |
 | `--iou_s_iou_weight` | `1.0` | IoU-S yaw-aware 3D IoU 抑制项权重 |
+| `--iou_s_original_steps` | `500` | 原论文 point perturbation 的 Adam 步数 |
+| `--iou_s_original_lr` | `0.01` | 原论文 point perturbation 的 Adam 学习率 |
+| `--iou_s_original_init_noise` | `0.01` | 原论文正向均匀 XYZ 初始噪声幅度 |
+| `--iou_s_original_distance_weight` | `1.0` | 原论文 Chamfer 与全局 XYZ L2 距离项权重 |
 | `--iadv_neighbor_scope` | `object` | I-ADV 的逐车、旧攻击点并集或全场景邻域/融合范围 |
 | `--save_adv` | 关闭 | 保存原始对抗点云，仅支持 point |
 | `--num_samples` | 全部 | 限制攻击样本数，用于调试 |

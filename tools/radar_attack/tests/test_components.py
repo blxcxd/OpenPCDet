@@ -25,11 +25,14 @@ from tools.radar_attack.attacks import (
     compute_reflectivity_features,
     extremum_fusion,
     iadv_rcs_attack,
+    original_iou_s_detection_loss,
+    original_iou_s_point_attack,
     point_cloud_attack,
     points_in_oriented_boxes,
     project_radar_measurements,
     radar_measurement_geometry_attack,
     radar_measurement_to_cartesian,
+    symmetric_chamfer_squared,
     voxel_attack,
 )
 from tools.radar_attack.attacks.gradient import project_points
@@ -56,6 +59,21 @@ class SumVoxelModel(nn.Module):
     def forward(self, batch_dict):
         self.last_voxels = batch_dict['voxels']
         return {'loss': batch_dict['voxels'].sum()}, {}, {}
+
+
+class DynamicPredictionModel(nn.Module):
+    """Small differentiable post-NMS-like model for original IoU-S tests."""
+
+    def forward(self, batch_dict):
+        xyz = batch_dict['points'][:, 1:4]
+        center = xyz.mean(dim=0)
+        box = torch.cat((center, xyz.new_tensor([1.0, 1.0, 1.0, 0.0])))
+        score = torch.sigmoid(xyz.sum().reshape(1))
+        return [{
+            'pred_boxes': box.reshape(1, 7),
+            'pred_scores': score,
+            'pred_labels': torch.ones(1, dtype=torch.long, device=xyz.device),
+        }], {'gt': 1, 'rcnn_0.5': 1}
 
 
 class RadarAttackComponentTest(unittest.TestCase):
@@ -357,6 +375,81 @@ class RadarAttackComponentTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(output.adv_points[0, 4].item(), 1.8, places=6)
+
+    def test_original_iou_s_loss_uses_every_gt_prediction_pair(self):
+        predictions = {
+            'pred_boxes': torch.tensor([
+                [0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+                [4.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0],
+            ], requires_grad=True),
+            'pred_scores': torch.tensor([0.8, 0.4], requires_grad=True),
+            'pred_labels': torch.tensor([1, 2]),
+        }
+        gt_boxes = torch.tensor([
+            [0.5, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 1.0],
+            [4.5, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ])
+
+        loss, pair_count = original_iou_s_detection_loss(
+            predictions, gt_boxes
+        )
+        loss.backward()
+
+        self.assertEqual(pair_count, 4)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(predictions['pred_boxes'].grad)
+        self.assertIsNotNone(predictions['pred_scores'].grad)
+
+    def test_symmetric_chamfer_matches_two_directed_terms(self):
+        first = torch.tensor([[0.0, 0.0, 0.0]])
+        second = torch.tensor([[1.0, 2.0, 2.0]])
+
+        distance = symmetric_chamfer_squared(first, second, chunk_size=1)
+
+        self.assertAlmostEqual(distance.item(), 18.0)
+
+    def test_original_iou_s_attack_is_full_scene_xyz_only(self):
+        points = torch.tensor([
+            [0.0, 0.5, 0.5, 0.5, 4.0, 0.2, 0.1, 0.0],
+            [0.0, 1.0, 0.5, 0.5, 5.0, 0.3, 0.2, -1.0],
+        ])
+        voxelizer = PointCloudVoxelizer(
+            point_cloud_range=[0, 0, 0, 4, 4, 4],
+            voxel_size=[1, 1, 1],
+            max_points_per_voxel=4,
+            max_voxels=10,
+            batch_size=1,
+        )
+        model = DynamicPredictionModel()
+        model.train()
+        gt_boxes = torch.tensor([[[
+            0.75, 0.5, 0.5, 1.0, 1.0, 1.0, 0.0, 1.0
+        ]]])
+
+        output = original_iou_s_point_attack(
+            model=model,
+            batch_dict={
+                'points': points,
+                'gt_boxes': gt_boxes,
+                'batch_size': 1,
+            },
+            voxelizer=voxelizer,
+            steps=2,
+            learning_rate=0.01,
+            initial_noise=0.001,
+            chamfer_chunk_size=1,
+        )
+
+        self.assertIsInstance(output, AttackOutput)
+        self.assertTrue(model.training)
+        self.assertTrue(torch.equal(output.adv_points[:, 0], points[:, 0]))
+        self.assertTrue(torch.equal(output.adv_points[:, 4:], points[:, 4:]))
+        self.assertGreater(output.stats['point_modified_points'], 0)
+        self.assertEqual(
+            output.stats['iou_s_original_hard_epsilon_projection'], 0.0
+        )
+        self.assertEqual(output.stats['iou_s_original_steps'], 2.0)
 
     def test_radar_measurement_cartesian_round_trip(self):
         xyz = torch.tensor(

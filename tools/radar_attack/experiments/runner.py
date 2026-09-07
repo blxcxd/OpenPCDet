@@ -54,6 +54,12 @@ VALUE_OPTIONS = (
     'iou_s_score_weight',
     'iou_s_iou_weight',
     'iou_s_log_epsilon',
+    'iou_s_original_steps',
+    'iou_s_original_lr',
+    'iou_s_original_init_noise',
+    'iou_s_original_distance_weight',
+    'iou_s_original_log_epsilon',
+    'iou_s_original_chamfer_chunk_size',
     'object_loss_iou_threshold',
     'object_loss_candidate_margin',
     'object_loss_candidate_topk',
@@ -127,6 +133,10 @@ SUMMARY_COLUMNS = (
     'iou_s_score_weight',
     'iou_s_iou_weight',
     'iou_s_log_epsilon',
+    'iou_s_original_steps',
+    'iou_s_original_lr',
+    'iou_s_original_init_noise',
+    'iou_s_original_distance_weight',
     'seed',
     'total_samples',
     'original_recall',
@@ -176,6 +186,12 @@ SUMMARY_COLUMNS = (
     'object_evidence_mean_candidates_per_target',
     'object_iou_s_targets',
     'object_iou_s_mean_candidates_per_target',
+    'iou_s_original_mean_predictions_per_step',
+    'iou_s_original_mean_pairs_per_step',
+    'iou_s_original_best_attack_loss',
+    'iou_s_original_best_distance_loss',
+    'iou_s_original_best_total_loss',
+    'iou_s_original_nonfinite_gradient_steps',
     'iadv_valid_targets',
     'iadv_mean_points_per_target',
     'iadv_pca_fallback_rate',
@@ -522,6 +538,14 @@ def result_to_row(
         'iou_s_score_weight': attack.get('iou_s_score_weight'),
         'iou_s_iou_weight': attack.get('iou_s_iou_weight'),
         'iou_s_log_epsilon': attack.get('iou_s_log_epsilon'),
+        'iou_s_original_steps': attack.get('iou_s_original_steps'),
+        'iou_s_original_lr': attack.get('iou_s_original_lr'),
+        'iou_s_original_init_noise': attack.get(
+            'iou_s_original_init_noise'
+        ),
+        'iou_s_original_distance_weight': attack.get(
+            'iou_s_original_distance_weight'
+        ),
         'seed': attack.get('seed'),
         'total_samples': metrics.get('total_samples'),
         'original_recall': metrics.get('original_recall'),
@@ -633,6 +657,24 @@ def result_to_row(
         'object_iou_s_targets': diagnostics.get('object_iou_s_targets'),
         'object_iou_s_mean_candidates_per_target': diagnostics.get(
             'object_iou_s_mean_candidates_per_target'
+        ),
+        'iou_s_original_mean_predictions_per_step': diagnostics.get(
+            'iou_s_original_mean_predictions_per_step'
+        ),
+        'iou_s_original_mean_pairs_per_step': diagnostics.get(
+            'iou_s_original_mean_pairs_per_step'
+        ),
+        'iou_s_original_best_attack_loss': diagnostics.get(
+            'iou_s_original_best_attack_loss'
+        ),
+        'iou_s_original_best_distance_loss': diagnostics.get(
+            'iou_s_original_best_distance_loss'
+        ),
+        'iou_s_original_best_total_loss': diagnostics.get(
+            'iou_s_original_best_total_loss'
+        ),
+        'iou_s_original_nonfinite_gradient_steps': diagnostics.get(
+            'iou_s_original_nonfinite_gradient_steps'
         ),
         'iadv_valid_targets': diagnostics.get('iadv_valid_targets'),
         'iadv_mean_points_per_target': diagnostics.get(

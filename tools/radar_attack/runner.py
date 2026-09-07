@@ -28,6 +28,7 @@ from radar_attack.adapters.openpcdet import (
 )
 from radar_attack.attacks.gradient import point_cloud_attack
 from radar_attack.attacks.iadv import build_iadv_attack_mask, iadv_rcs_attack
+from radar_attack.attacks.iou_s_original import original_iou_s_point_attack
 from radar_attack.attacks.measurement import (
     TEMPORAL_PARAMETER_MODES,
     build_measurement_attack_mask,
@@ -189,8 +190,11 @@ def parse_config():
         ),
     )
     parser.add_argument('--attack_type', type=str, default='fgsm',
-                        choices=['fgsm', 'pgd', 'iadv'],
-                        help='attack type: fgsm, pgd, or I-ADV-RCS')
+                        choices=['fgsm', 'pgd', 'iadv', 'iou_s_original'],
+                        help=(
+                            'attack type: FGSM, PGD, I-ADV-RCS, or the '
+                            'paper-faithful IoU-S point perturbation'
+                        ))
     parser.add_argument('--pgd_steps', type=int, default=5, help='PGD steps')
     parser.add_argument('--step_size', type=float, default=None,
                         help='point PGD step size (default: 2 * epsilon / steps)')
@@ -306,6 +310,19 @@ def parse_config():
                         help='weight of the IoU-S differentiable 3D-IoU term')
     parser.add_argument('--iou_s_log_epsilon', type=float, default=1e-6,
                         help='numerical epsilon inside IoU-S logarithms')
+    parser.add_argument('--iou_s_original_steps', type=int, default=500,
+                        help='official IoU-S point-perturbation Adam steps')
+    parser.add_argument('--iou_s_original_lr', type=float, default=0.01,
+                        help='official IoU-S point-perturbation Adam learning rate')
+    parser.add_argument('--iou_s_original_init_noise', type=float, default=0.01,
+                        help='positive uniform XYZ initialization amplitude')
+    parser.add_argument('--iou_s_original_distance_weight', type=float, default=1.0,
+                        help='weight of Chamfer plus global XYZ L2 regularization')
+    parser.add_argument('--iou_s_original_log_epsilon', type=float, default=1e-8,
+                        help='official numerical epsilon inside IoU-S logarithms')
+    parser.add_argument('--iou_s_original_chamfer_chunk_size', type=int,
+                        default=1024,
+                        help='point chunk size for exact Chamfer computation')
     parser.add_argument('--iadv_steps', type=int, default=10,
                         help='I-ADV iteration count')
     parser.add_argument('--iadv_scope', choices=['gt_boxes', 'scene'],
@@ -391,6 +408,18 @@ def parse_config():
         parser.error('--pgd_steps must be positive')
     if args.iadv_steps <= 0:
         parser.error('--iadv_steps must be positive')
+    if args.iou_s_original_steps <= 0:
+        parser.error('--iou_s_original_steps must be positive')
+    if args.iou_s_original_lr <= 0:
+        parser.error('--iou_s_original_lr must be positive')
+    if args.iou_s_original_init_noise < 0:
+        parser.error('--iou_s_original_init_noise must be non-negative')
+    if args.iou_s_original_distance_weight < 0:
+        parser.error('--iou_s_original_distance_weight must be non-negative')
+    if not 0 < args.iou_s_original_log_epsilon < 1:
+        parser.error('--iou_s_original_log_epsilon must be in (0, 1)')
+    if args.iou_s_original_chamfer_chunk_size <= 0:
+        parser.error('--iou_s_original_chamfer_chunk_size must be positive')
     if args.step_size is not None and args.step_size <= 0:
         parser.error('--step_size must be positive')
     if args.num_samples is not None and args.num_samples <= 0:
@@ -418,6 +447,50 @@ def parse_config():
             parser.error(
                 '--iadv_neighbor_scope object requires --iadv_scope gt_boxes'
             )
+    if args.attack_type == 'iou_s_original':
+        if args.attack_domain != 'point':
+            parser.error('--attack_type iou_s_original requires --attack_domain point')
+        if args.attack_space != 'feature' or args.attack_feature != 'xyz':
+            parser.error(
+                '--attack_type iou_s_original requires '
+                '--attack_space feature --attack_feature xyz'
+            )
+        if args.voxel_mode != 'revoxelize':
+            parser.error(
+                '--attack_type iou_s_original requires --voxel_mode revoxelize'
+            )
+        if args.point_scope != 'scene':
+            parser.error(
+                '--attack_type iou_s_original requires --point_scope scene'
+            )
+        if args.point_target_selection != 'all_gt':
+            parser.error(
+                '--attack_type iou_s_original requires '
+                '--point_target_selection all_gt'
+            )
+        if args.attack_loss != 'training':
+            parser.error(
+                '--attack_loss is not used by iou_s_original; leave it at training'
+            )
+        if args.batch_size != 1:
+            parser.error('--attack_type iou_s_original requires --batch_size 1')
+        if args.random_start:
+            parser.error(
+                'iou_s_original has its own positive uniform initialization; '
+                'do not use --random_start'
+            )
+        if args.current_sweep_only or args.temporal_mode != 'none':
+            parser.error(
+                'iou_s_original attacks the full accumulated scene and does '
+                'not use current-sweep or temporal parameter restrictions'
+            )
+        if args.step_size is not None or args.epsilon_xyz is not None:
+            parser.error(
+                'iou_s_original uses Adam and distance regularization, not '
+                '--step_size or --epsilon_xyz'
+            )
+        if args.launcher != 'none':
+            parser.error('--attack_type iou_s_original requires --launcher none')
     if args.attack_space == 'radar_measurement':
         if args.attack_domain != 'point':
             parser.error('--attack_space radar_measurement requires --attack_domain point')
@@ -768,6 +841,20 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'iou_s_score_weight': args.iou_s_score_weight,
                     'iou_s_iou_weight': args.iou_s_iou_weight,
                     'iou_s_log_epsilon': args.iou_s_log_epsilon,
+                    'iou_s_original_steps': args.iou_s_original_steps,
+                    'iou_s_original_lr': args.iou_s_original_lr,
+                    'iou_s_original_init_noise': (
+                        args.iou_s_original_init_noise
+                    ),
+                    'iou_s_original_distance_weight': (
+                        args.iou_s_original_distance_weight
+                    ),
+                    'iou_s_original_log_epsilon': (
+                        args.iou_s_original_log_epsilon
+                    ),
+                    'iou_s_original_chamfer_chunk_size': (
+                        args.iou_s_original_chamfer_chunk_size
+                    ),
                     'iadv_steps': args.iadv_steps,
                     'iadv_scope': args.iadv_scope,
                     'iadv_neighbor_scope': args.iadv_neighbor_scope,
@@ -862,6 +949,20 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     box_margin=args.iadv_box_margin,
                     rcs_min=args.iadv_rcs_min,
                     rcs_max=args.iadv_rcs_max,
+                )
+            elif args.attack_type == 'iou_s_original':
+                attack_output = original_iou_s_point_attack(
+                    model=model,
+                    batch_dict=batch_dict,
+                    voxelizer=voxelizer,
+                    steps=args.iou_s_original_steps,
+                    learning_rate=args.iou_s_original_lr,
+                    initial_noise=args.iou_s_original_init_noise,
+                    distance_weight=args.iou_s_original_distance_weight,
+                    log_epsilon=args.iou_s_original_log_epsilon,
+                    chamfer_chunk_size=(
+                        args.iou_s_original_chamfer_chunk_size
+                    ),
                 )
             else:
                 point_mask = None
@@ -1239,7 +1340,9 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     logger.info(f'Default Epsilon: {args.epsilon}')
     logger.info(f'Attack Feature: {args.attack_feature}')
     logger.info(f'Attack Space: {args.attack_space}')
-    if args.attack_domain == 'point' and args.attack_type != 'iadv':
+    if args.attack_domain == 'point' and args.attack_type not in {
+        'iadv', 'iou_s_original'
+    }:
         logger.info(f'Attack Loss: {args.attack_loss}')
         logger.info(f'Point Target Selection: {args.point_target_selection}')
     if args.attack_type == 'pgd':
@@ -1249,6 +1352,20 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
         logger.info(f'I-ADV Scope: {args.iadv_scope}')
         logger.info(f'I-ADV Neighbor Scope: {args.iadv_neighbor_scope}')
         logger.info('I-ADV Target Classes: %s', ', '.join(target_class_names))
+    elif args.attack_type == 'iou_s_original':
+        logger.info('Original IoU-S Adam Steps: %d', args.iou_s_original_steps)
+        logger.info('Original IoU-S Adam LR: %g', args.iou_s_original_lr)
+        logger.info(
+            'Original IoU-S init / distance weight: %g / %g',
+            args.iou_s_original_init_noise,
+            args.iou_s_original_distance_weight,
+        )
+        logger.info('Original IoU-S Point Scope: full scene')
+        logger.info('Original IoU-S Hard Epsilon Projection: disabled')
+        logger.info(
+            'Original IoU-S evaluation target classes: %s',
+            ', '.join(target_class_names),
+        )
     if args.attack_domain == 'point':
         for group in ('xyz', 'rcs', 'doppler', 'time'):
             value = getattr(args, f'epsilon_{group}')
@@ -1346,6 +1463,22 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 ),
                 args.iou_s_score_weight,
                 args.iou_s_iou_weight,
+            )
+        if args.attack_type == 'iou_s_original':
+            logger.info(
+                'Original IoU-S mean predictions / GT-prediction pairs '
+                'per step: %.1f / %.1f',
+                diagnostics.get(
+                    'iou_s_original_mean_predictions_per_step', 0.0
+                ),
+                diagnostics.get('iou_s_original_mean_pairs_per_step', 0.0),
+            )
+            logger.info(
+                'Original IoU-S best attack / distance / total loss: '
+                '%.6f / %.6f / %.6f',
+                diagnostics.get('iou_s_original_best_attack_loss', 0.0),
+                diagnostics.get('iou_s_original_best_distance_loss', 0.0),
+                diagnostics.get('iou_s_original_best_total_loss', 0.0),
             )
     logger.info(f'Total Samples: {results["total_samples"]}')
     logger.info(f'Original Recall@0.5: {results["original_recall"]:.4f}')
@@ -1495,7 +1628,9 @@ def main():
         f.write(f'Default Epsilon: {args.epsilon}\n')
         f.write(f'Attack Feature: {args.attack_feature}\n')
         f.write(f'Attack Space: {args.attack_space}\n')
-        if args.attack_domain == 'point' and args.attack_type != 'iadv':
+        if args.attack_domain == 'point' and args.attack_type not in {
+            'iadv', 'iou_s_original'
+        }:
             f.write(f'Attack Loss: {args.attack_loss}\n')
             f.write(
                 f'Point Target Selection: {args.point_target_selection}\n'
@@ -1510,6 +1645,21 @@ def main():
                 'I-ADV Target Classes: '
                 f'{", ".join(results["object_outcomes"]["target_classes"])}\n'
             )
+        elif args.attack_type == 'iou_s_original':
+            f.write(
+                f'Original IoU-S Adam Steps: {args.iou_s_original_steps}\n'
+            )
+            f.write(f'Original IoU-S Adam LR: {args.iou_s_original_lr}\n')
+            f.write(
+                'Original IoU-S Init Noise: '
+                f'{args.iou_s_original_init_noise}\n'
+            )
+            f.write(
+                'Original IoU-S Distance Weight: '
+                f'{args.iou_s_original_distance_weight}\n'
+            )
+            f.write('Original IoU-S Point Scope: full scene\n')
+            f.write('Original IoU-S Hard Epsilon Projection: disabled\n')
         if args.attack_domain == 'point':
             for group in ('xyz', 'rcs', 'doppler', 'time'):
                 value = getattr(args, f'epsilon_{group}')
