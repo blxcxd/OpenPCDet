@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "dataset": "View-of-Delft",
+  "stage": "Stage 2 GT-motion-compensated mutual-NN clean matched pairs",
+  "gate_m": 1.0,
+  "quantile": 0.95,
+  "units": "m",
+  "source_file": "output/vod_car_statistics/stage2_matching/point_quantiles.csv",
+  "source_sha256": "0315c410fa46ead53c3448d8cfc5d39df759b7317ebcd9a815d47b658615701a",
+  "source_bin_basis": "mean GT-center range of the clean object-frame pair",
+  "application_bin_basis": "clean range of the attacked point",
+  "metrics": {
+    "range": "abs_delta_r",
+    "azimuth": "delta_s_az",
+    "elevation": "delta_s_el"
+  },
+  "bins": [
+    {
+      "label": "0-10",
+      "range_min_m": 0.0,
+      "range_max_m": 10.0,
+      "include_upper": false,
+      "matched_pairs": 16755,
+      "q95_range_m": 0.24809916564629475,
+      "q95_azimuth_m": 0.1987265534916056,
+      "q95_elevation_m": 0.20222886913995902
+    },
+    {
+      "label": "10-20",
+      "range_min_m": 10.0,
+      "range_max_m": 20.0,
+      "include_upper": false,
+      "matched_pairs": 11243,
+      "q95_range_m": 0.35166301044439796,
+      "q95_azimuth_m": 0.2765218788074053,
+      "q95_elevation_m": 0.3214613796450954
+    },
+    {
+      "label": "20-30",
+      "range_min_m": 20.0,
+      "range_max_m": 30.0,
+      "include_upper": false,
+      "matched_pairs": 6899,
+      "q95_range_m": 0.38580776735861333,
+      "q95_azimuth_m": 0.3246852347350595,
+      "q95_elevation_m": 0.385273922220705
+    },
+    {
+      "label": "30-50",
+      "range_min_m": 30.0,
+      "range_max_m": 50.0,
+      "include_upper": true,
+      "matched_pairs": 5955,
+      "q95_range_m": 0.44307796364816104,
+      "q95_azimuth_m": 0.41731690557379003,
+      "q95_elevation_m": 0.44213362113215665
+    }
+  ]
+}

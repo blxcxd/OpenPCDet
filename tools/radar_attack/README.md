@@ -139,6 +139,47 @@ python tools/radar_attack/run_attack.py \
 这是 measurement-consistent digital geometry attack，不是 waveform/IQ-level
 攻击，也不能据此声称已经具有完整物理可实现性。
 
+#### Stage 2 Q95 归一化几何异常度
+
+所有 point-domain 攻击还会对攻击前后同索引点计算：
+
+```text
+x_r     = |delta range|
+x_alpha = mean_range * cos(mean_elevation) * |wrapped delta azimuth|
+x_theta = mean_range * |delta elevation|
+```
+
+三项单位均为米。程序只使用 Stage 2 clean matched-pair statistics 的
+`d_xyz <= 1 m` gate，并按 clean 点自身 range 查询 `0-10/10-20/20-30/30-50 m`
+桶中的 `abs_delta_r/delta_s_az/delta_s_el` P95：
+
+```text
+z_r     = x_r / Q95_r(range_bin)
+z_alpha = x_alpha / Q95_alpha(range_bin)
+z_theta = x_theta / Q95_theta(range_bin)
+A       = max(z_r, z_alpha, z_theta)
+```
+
+默认参考被固化在
+`tools/radar_attack/references/vod_stage2_gate1_q95.json`，包含源
+`point_quantiles.csv` 的 SHA256。加载时强制检查 `gate_m == 1.0` 和
+`quantile == 0.95`，防止误用其他 gate。可用
+`--measurement_q95_reference` 指定同格式参考文件，但仍必须是 1 m gate。
+
+逐点结果保留完整 `(z_r,z_alpha,z_theta)`，输出为：
+
+```text
+measurement_naturalness_points.csv.gz
+```
+
+汇总结果同时报告三个 z 的 P95、A 的 P50/P95/P99/max、`A>1/2/5` 比例、
+最异常维度占比，并分别统计所有参考覆盖点与实际发生几何变化的覆盖点。
+clean range 超出 `0-50 m` 的点标为未覆盖，不使用全局 Q95 偷偷回填。
+
+注意：Stage 2 原统计按相邻 Car 目标帧对的平均 GT 中心 range 分桶；这里按
+用户定义使用攻击点自身 clean range 查桶。对象框内点二者接近，但对背景点及
+其他类别，这是一个需要在论文中明确声明的参考尺度迁移，而不是传感器概率模型。
+
 #### 多 sweep 时序预处理
 
 `prepare_temporal.py` 为多 sweep measurement attack 恢复数据层元信息；三个
@@ -833,6 +874,7 @@ python tools/radar_attack/run_experiments.py \
 | `--epsilon_range` | measurement attack 的距离预算，单位 m |
 | `--epsilon_azimuth_deg` | measurement attack 的方位角预算，单位 degree |
 | `--epsilon_elevation_deg` | measurement attack 的俯仰角预算，单位 degree |
+| `--measurement_q95_reference` | 固定为 Stage 2 `1 m gate` 的 Q95 参考 JSON |
 
 这些值作用在数据加载和特征编码后的数值上，单位跟随数据集中的对应特征。对当前 VoD 雷达配置，`xyz` 通常以米表示，速度和时间预算应根据实际数据定义与统计范围选择，不能直接把 `xyz` 的 epsilon 照搬给所有特征。
 

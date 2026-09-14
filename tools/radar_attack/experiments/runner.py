@@ -35,6 +35,7 @@ VALUE_OPTIONS = (
     'epsilon_range',
     'epsilon_azimuth_deg',
     'epsilon_elevation_deg',
+    'measurement_q95_reference',
     'step_size_range',
     'step_size_azimuth_deg',
     'step_size_elevation_deg',
@@ -182,6 +183,18 @@ SUMMARY_COLUMNS = (
     'measurement_max_delta_elevation_rad',
     'measurement_max_xyz_l2',
     'measurement_mean_xyz_l2',
+    'measurement_q95_gate_m',
+    'measurement_q95_coverage_fraction',
+    'measurement_z_range_p95',
+    'measurement_z_azimuth_p95',
+    'measurement_z_elevation_p95',
+    'measurement_A_p50',
+    'measurement_A_p95',
+    'measurement_A_p99',
+    'measurement_A_max',
+    'measurement_A_gt_1_fraction',
+    'measurement_modified_A_p95',
+    'measurement_modified_A_gt_1_fraction',
     'measurement_historical_modifications',
     'measurement_non_target_modifications',
     'object_evidence_targets',
@@ -491,6 +504,12 @@ def result_to_row(
     metrics = payload.get('metrics', {}) if payload else {}
     vod = metrics.get('vod_official', {})
     diagnostics = metrics.get('attack_diagnostics', {})
+    naturalness = metrics.get('measurement_naturalness', {})
+    naturalness_all = naturalness.get('all_covered', {})
+    naturalness_modified = naturalness.get('modified_covered', {})
+    naturalness_z = naturalness_all.get('z', {})
+    naturalness_A = naturalness_all.get('A', {})
+    naturalness_modified_A = naturalness_modified.get('A', {})
     endpoint = metrics.get('object_endpoint_metrics', {})
     outcomes = metrics.get('object_outcomes', {})
     outcome_counts = outcomes.get('counts', {})
@@ -659,6 +678,32 @@ def result_to_row(
         'measurement_mean_xyz_l2': diagnostics.get(
             'measurement_mean_xyz_l2'
         ),
+        'measurement_q95_gate_m': naturalness.get(
+            'reference', {}
+        ).get('gate_m'),
+        'measurement_q95_coverage_fraction': naturalness.get(
+            'coverage_fraction'
+        ),
+        'measurement_z_range_p95': naturalness_z.get(
+            'range', {}
+        ).get('p95'),
+        'measurement_z_azimuth_p95': naturalness_z.get(
+            'azimuth', {}
+        ).get('p95'),
+        'measurement_z_elevation_p95': naturalness_z.get(
+            'elevation', {}
+        ).get('p95'),
+        'measurement_A_p50': naturalness_A.get('p50'),
+        'measurement_A_p95': naturalness_A.get('p95'),
+        'measurement_A_p99': naturalness_A.get('p99'),
+        'measurement_A_max': naturalness_A.get('max'),
+        'measurement_A_gt_1_fraction': naturalness_all.get(
+            'A_exceedance_fraction', {}
+        ).get('gt_1'),
+        'measurement_modified_A_p95': naturalness_modified_A.get('p95'),
+        'measurement_modified_A_gt_1_fraction': naturalness_modified.get(
+            'A_exceedance_fraction', {}
+        ).get('gt_1'),
         'measurement_historical_modifications': diagnostics.get(
             'measurement_historical_modification_count'
         ),

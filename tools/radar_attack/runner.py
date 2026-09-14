@@ -41,6 +41,8 @@ from radar_attack.attacks.voxel import voxel_attack
 from radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    MeasurementNaturalnessAccumulator,
+    MeasurementQ95Reference,
     build_target_screening_context,
     compare_target_object_endpoints,
     evaluate_vod_pair,
@@ -212,6 +214,17 @@ def parse_config():
                         help='measurement-space azimuth budget in degrees')
     parser.add_argument('--epsilon_elevation_deg', type=float, default=None,
                         help='measurement-space elevation budget in degrees')
+    parser.add_argument(
+        '--measurement_q95_reference',
+        default=(
+            'tools/radar_attack/references/'
+            'vod_stage2_gate1_q95.json'
+        ),
+        help=(
+            'Stage 2 clean matched-pair Q95 reference; the file is validated '
+            'to use the 1 m gate'
+        ),
+    )
     parser.add_argument('--step_size_range', type=float, default=None,
                         help='measurement PGD range step in metres')
     parser.add_argument('--step_size_azimuth_deg', type=float, default=None,
@@ -687,6 +700,17 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     metrics = DetectionAttackMetrics()
     writer = None
     dataset = dataloader.dataset
+    naturalness = None
+    if args.attack_domain == 'point':
+        reference_path = Path(args.measurement_q95_reference).expanduser()
+        if not reference_path.is_absolute():
+            reference_path = cfg.ROOT_DIR / reference_path
+        naturalness_reference = MeasurementQ95Reference.load(reference_path)
+        naturalness = MeasurementNaturalnessAccumulator(naturalness_reference)
+        logger.info(
+            'Measurement naturalness Q95 reference: %s (gate=1 m)',
+            naturalness_reference.path,
+        )
     feature_names = get_feature_names(cfg.DATA_CONFIG)
     target_class_names, target_class_ids, object_iou_thresholds = (
         resolve_object_targets(args, dataset.class_names)
@@ -813,6 +837,9 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'step_size_elevation_deg': args.step_size_elevation_deg,
                     'measurement_budget_semantics': (
                         args.measurement_budget_semantics
+                    ),
+                    'measurement_q95_reference': str(
+                        naturalness.reference.path
                     ),
                     'temporal_mode': args.temporal_mode,
                     'temporal_dataset_root': args.temporal_dataset_root,
@@ -1223,6 +1250,11 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             batch_dict['points'] = attack_output.adv_points
             batch_dict.update(attack_output.model_inputs)
             metrics.update_perturbation(attack_output.stats)
+            naturalness.update(
+                original_points,
+                attack_output.adv_points,
+                batch_dict['frame_id'],
+            )
             if writer is not None:
                 writer.save_batch(
                     original_points,
@@ -1287,6 +1319,11 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
 
     progress_bar.close()
     results = metrics.compute()
+    if naturalness is not None:
+        naturalness_path = output_dir / 'measurement_naturalness_points.csv.gz'
+        naturalness.write_csv(naturalness_path)
+        results['measurement_naturalness'] = naturalness.compute()
+        results['measurement_naturalness_file'] = str(naturalness_path)
     for class_name in target_class_names:
         results['object_outcomes']['by_class'].setdefault(
             class_name,
@@ -1581,6 +1618,44 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             endpoint['object_evidence_drop']['positive_fraction'],
         )
     logger.info('Object endpoint CSV: %s', results['object_endpoint_file'])
+    if 'measurement_naturalness' in results:
+        naturalness_result = results['measurement_naturalness']
+        covered = naturalness_result['all_covered']
+        modified = naturalness_result['modified_covered']
+        logger.info(
+            'Measurement Q95 naturalness reference gate / coverage: 1 m / '
+            '%.4f (%d/%d)',
+            naturalness_result['coverage_fraction'] or 0.0,
+            naturalness_result['covered_points'],
+            naturalness_result['total_points'],
+        )
+        logger.info(
+            'Measurement normalized z P95 (range / azimuth / elevation): '
+            '%.4f / %.4f / %.4f',
+            covered['z']['range']['p95'] or 0.0,
+            covered['z']['azimuth']['p95'] or 0.0,
+            covered['z']['elevation']['p95'] or 0.0,
+        )
+        logger.info(
+            'Measurement anomaly A P50 / P95 / P99 / max / fraction>1: '
+            '%.4f / %.4f / %.4f / %.4f / %.4f',
+            covered['A']['p50'] or 0.0,
+            covered['A']['p95'] or 0.0,
+            covered['A']['p99'] or 0.0,
+            covered['A']['max'] or 0.0,
+            covered['A_exceedance_fraction']['gt_1'] or 0.0,
+        )
+        logger.info(
+            'Measurement anomaly among modified covered points: n=%d, '
+            'A P95=%.4f, fraction>1=%.4f',
+            modified['count'],
+            modified['A']['p95'] or 0.0,
+            modified['A_exceedance_fraction']['gt_1'] or 0.0,
+        )
+        logger.info(
+            'Measurement naturalness per-point CSV: %s',
+            results['measurement_naturalness_file'],
+        )
     logger.info(f'Recall Drop: {results["recall_drop"]:.4f}')
     if 'vod_official' in results:
         vod_results = results['vod_official']
@@ -1724,6 +1799,36 @@ def main():
                 if value is not None:
                     f.write(f'Epsilon {group}: {value}\n')
             f.write(f'Voxel Mode: {args.voxel_mode}\n')
+            naturalness_result = results['measurement_naturalness']
+            covered = naturalness_result['all_covered']
+            f.write('Measurement Q95 Reference Gate: 1 m\n')
+            f.write(
+                'Measurement Q95 Reference: '
+                f'{naturalness_result["reference"]["path"]}\n'
+            )
+            f.write(
+                'Measurement Q95 Coverage: '
+                f'{naturalness_result["coverage_fraction"]}\n'
+            )
+            f.write(
+                'Measurement z P95 (range/azimuth/elevation): '
+                f'{covered["z"]["range"]["p95"]} / '
+                f'{covered["z"]["azimuth"]["p95"]} / '
+                f'{covered["z"]["elevation"]["p95"]}\n'
+            )
+            f.write(
+                'Measurement A P50/P95/P99/max: '
+                f'{covered["A"]["p50"]} / {covered["A"]["p95"]} / '
+                f'{covered["A"]["p99"]} / {covered["A"]["max"]}\n'
+            )
+            f.write(
+                'Measurement A Fraction > 1: '
+                f'{covered["A_exceedance_fraction"]["gt_1"]}\n'
+            )
+            f.write(
+                'Measurement Naturalness CSV: '
+                f'{results["measurement_naturalness_file"]}\n'
+            )
             if args.attack_space == 'radar_measurement':
                 f.write(f'Temporal Mode: {args.temporal_mode}\n')
                 f.write(

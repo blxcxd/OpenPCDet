@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import unittest
@@ -40,9 +41,12 @@ from tools.radar_attack.attacks.gradient import project_points
 from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
     DetectionAttackMetrics,
+    MeasurementNaturalnessAccumulator,
+    MeasurementQ95Reference,
     compare_target_object_endpoints,
     build_target_screening_context,
     merge_target_diagnostics,
+    point_measurement_naturalness,
     prepare_prediction_directory,
     summarize_current_sweep,
     target_attack_diagnostics,
@@ -493,6 +497,98 @@ class RadarAttackComponentTest(unittest.TestCase):
         )
         self.assertEqual(last_output.stats['iou_s_original_return_last'], 1.0)
         self.assertTrue(torch.equal(last_output.adv_points[:, 4:], points[:, 4:]))
+
+    def test_measurement_naturalness_uses_gate1_q95_and_wrapped_angles(self):
+        reference = MeasurementQ95Reference.load(
+            Path(__file__).resolve().parents[1]
+            / 'references/vod_stage2_gate1_q95.json'
+        )
+        angle_clean = np.radians(179.0)
+        angle_adversarial = np.radians(-179.0)
+        elevation = 0.02
+        clean = torch.tensor([
+            [0.0, 5.0 * np.cos(angle_clean), 5.0 * np.sin(angle_clean), 0.0],
+            [0.0, 20.0, 0.0, 0.0],
+            [0.0, 60.0, 0.0, 0.0],
+        ], dtype=torch.float64)
+        adversarial = torch.tensor([
+            [
+                0.0,
+                5.0 * np.cos(angle_adversarial),
+                5.0 * np.sin(angle_adversarial),
+                0.0,
+            ],
+            [
+                0.0,
+                20.0 * np.cos(elevation),
+                0.0,
+                20.0 * np.sin(elevation),
+            ],
+            [0.0, 60.1, 0.0, 0.0],
+        ], dtype=torch.float64)
+
+        result = point_measurement_naturalness(
+            clean, adversarial, reference
+        )
+
+        self.assertEqual(reference.metadata['gate_m'], 1.0)
+        self.assertAlmostEqual(
+            result['x'][0, 1], 5.0 * np.radians(2.0), places=8
+        )
+        self.assertAlmostEqual(result['x'][1, 2], 20.0 * elevation, places=8)
+        self.assertEqual(result['bin_index'].tolist(), [0, 2, -1])
+        self.assertEqual(result['covered'].tolist(), [True, True, False])
+        self.assertAlmostEqual(
+            result['z'][1, 2],
+            0.4 / 0.385273922220705,
+            places=8,
+        )
+
+    def test_measurement_naturalness_rejects_non_one_metre_gate(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / 'references/vod_stage2_gate1_q95.json'
+        )
+        payload = json.loads(source_path.read_text(encoding='utf-8'))
+        payload['gate_m'] = 0.5
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wrong_gate.json'
+            path.write_text(json.dumps(payload), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, '1 m gate'):
+                MeasurementQ95Reference.load(path)
+
+    def test_measurement_naturalness_accumulator_keeps_pointwise_tuple(self):
+        reference = MeasurementQ95Reference.load(
+            Path(__file__).resolve().parents[1]
+            / 'references/vod_stage2_gate1_q95.json'
+        )
+        clean = torch.tensor([
+            [0.0, 5.0, 0.0, 0.0],
+            [0.0, 15.0, 0.0, 0.0],
+        ])
+        adversarial = clean.clone()
+        adversarial[0, 1] += 0.3
+        accumulator = MeasurementNaturalnessAccumulator(reference)
+        accumulator.update(clean, adversarial, ['000001'])
+
+        summary = accumulator.compute()
+
+        self.assertEqual(summary['total_points'], 2)
+        self.assertEqual(summary['covered_points'], 2)
+        self.assertEqual(summary['modified_points'], 1)
+        self.assertGreater(
+            summary['modified_covered']['A_exceedance_fraction']['gt_1'], 0
+        )
+        self.assertEqual(summary['by_range_bin']['0-10']['all_covered']['count'], 1)
+        self.assertEqual(summary['by_range_bin']['10-20']['all_covered']['count'], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'points.csv.gz'
+            accumulator.write_csv(path)
+            with gzip.open(path, 'rt', encoding='utf-8') as stream:
+                header = stream.readline()
+                rows = stream.readlines()
+            self.assertIn('z_range,z_azimuth,z_elevation,A', header)
+            self.assertEqual(len(rows), 2)
 
     def test_radar_measurement_cartesian_round_trip(self):
         xyz = torch.tensor(

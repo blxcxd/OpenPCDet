@@ -1,4 +1,9 @@
 from .metrics import DetectionAttackMetrics
+from .measurement_naturalness import (
+    MeasurementNaturalnessAccumulator,
+    MeasurementQ95Reference,
+    point_measurement_naturalness,
+)
 from .object_endpoints import compare_target_object_endpoints
 from .screening import (
     build_target_screening_context,
@@ -20,6 +25,9 @@ from .vod import (
 __all__ = [
     'AdversarialPointCloudWriter',
     'DetectionAttackMetrics',
+    'MeasurementNaturalnessAccumulator',
+    'MeasurementQ95Reference',
+    'point_measurement_naturalness',
     'compare_target_object_endpoints',
     'build_target_screening_context',
     'merge_target_diagnostics',
