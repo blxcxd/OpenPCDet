@@ -520,6 +520,14 @@ def result_to_row(
     naturalness_z = naturalness_all.get('z', {})
     naturalness_A = naturalness_all.get('A', {})
     naturalness_modified_A = naturalness_modified.get('A', {})
+    naturalness_reference_region = naturalness.get(
+        'reference_region_covered', {}
+    )
+    naturalness_reference_A = naturalness_reference_region.get('A', {})
+    naturalness_reference_joint = naturalness_reference_region.get(
+        'joint_exceedance_fraction', {}
+    )
+    migration_groups = metrics.get('attack_migration', {}).get('groups', {})
     endpoint = metrics.get('object_endpoint_metrics', {})
     outcomes = metrics.get('object_outcomes', {})
     outcome_counts = outcomes.get('counts', {})
@@ -716,6 +724,23 @@ def result_to_row(
         'measurement_modified_A_gt_1_fraction': naturalness_modified.get(
             'A_exceedance_fraction', {}
         ).get('gt_1'),
+        'reference_region_points': naturalness_reference_region.get('count'),
+        'reference_region_A_p95': naturalness_reference_A.get('p95'),
+        'reference_region_A_max': naturalness_reference_A.get('max'),
+        'reference_region_R_joint95': naturalness_reference_joint.get(
+            'R_joint95'
+        ),
+        'reference_region_R_joint99': naturalness_reference_joint.get(
+            'R_joint99'
+        ),
+        **{
+            f'migration_{group_name}_{field}': group.get(field)
+            for group_name, group in migration_groups.items()
+            for field in (
+                'total_points', 'N_modified', 'mean_l2_m', 'p95_l2_m',
+                'max_l2_m', 'sum_l2_m',
+            )
+        },
         'measurement_historical_modifications': diagnostics.get(
             'measurement_historical_modification_count'
         ),

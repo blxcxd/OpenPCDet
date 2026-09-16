@@ -42,6 +42,7 @@ from tools.radar_attack.attacks import (
 from tools.radar_attack.attacks.gradient import project_points
 from tools.radar_attack.evaluation import (
     AdversarialPointCloudWriter,
+    AttackMigrationAccumulator,
     DetectionAttackMetrics,
     MeasurementNaturalnessAccumulator,
     MeasurementQ95Reference,
@@ -667,6 +668,64 @@ class RadarAttackComponentTest(unittest.TestCase):
                 rows = stream.readlines()
             self.assertIn('z_range,z_azimuth,z_elevation,A', header)
             self.assertEqual(len(rows), 2)
+
+    def test_reference_region_reports_joint_clean_exceedance(self):
+        reference = MeasurementQ95Reference.load(
+            Path(__file__).resolve().parents[1]
+            / 'references/vod_stage2_gate1_point_range_q95.json'
+        )
+        clean = torch.tensor([[0.0, 5.0, 0.0, 0.0]], dtype=torch.float64)
+        adversarial = clean.clone()
+        adversarial[0, 1] += 0.4
+        accumulator = MeasurementNaturalnessAccumulator(reference)
+        accumulator.update(
+            clean,
+            adversarial,
+            ['000001'],
+            reference_region_mask=torch.tensor([True]),
+        )
+
+        region = accumulator.compute()['reference_region_covered']
+
+        self.assertEqual(region['count'], 1)
+        self.assertAlmostEqual(region['A']['p95'], 0.4 / 0.24600650084981002)
+        self.assertEqual(
+            region['joint_exceedance_fraction']['R_joint95'], 1.0
+        )
+        self.assertEqual(
+            region['joint_exceedance_fraction']['R_joint99'], 0.0
+        )
+
+    def test_attack_migration_uses_frozen_clean_groups(self):
+        clean = torch.tensor([
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0, 0.0],
+        ])
+        adversarial = clean.clone()
+        adversarial[0, 1] += 0.1
+        adversarial[1, 2] += 0.2
+        adversarial[2, 3] += 0.3
+        accumulator = AttackMigrationAccumulator()
+        accumulator.update(
+            clean,
+            adversarial,
+            target_mask=torch.tensor([True, True, False, False]),
+            current_mask=torch.tensor([True, False, True, False]),
+        )
+
+        groups = accumulator.compute()['groups']
+
+        self.assertEqual(groups['target_current']['N_modified'], 1)
+        self.assertAlmostEqual(groups['target_current']['sum_l2_m'], 0.1)
+        self.assertEqual(groups['target_history']['N_modified'], 1)
+        self.assertAlmostEqual(groups['target_history']['sum_l2_m'], 0.2)
+        self.assertEqual(groups['non_target_background']['total_points'], 2)
+        self.assertEqual(groups['non_target_background']['N_modified'], 1)
+        self.assertAlmostEqual(
+            groups['non_target_background']['sum_l2_m'], 0.3
+        )
 
     def test_radar_measurement_cartesian_round_trip(self):
         xyz = torch.tensor(

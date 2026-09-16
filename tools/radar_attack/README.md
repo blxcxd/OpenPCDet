@@ -385,6 +385,16 @@ python tools/radar_attack/run_experiments.py \
 `weighted_geometry_loss` 相对 `iou_s_detection_loss` 的实际比例判断权重，而
 不能只比较名义 lambda。
 
+自然度结果另外固定报告 Car-GT-associated、`time=0`、`0--50 m` 参考区域的
+`A_P95`、`A_max`、`R_joint95` 和 `R_joint99`。其中 `R_joint95/99` 使用同一批
+Stage 2 gate=1 m clean pairs，在每个 clean-point-range 桶内对
+`A=max(z_range,z_azimuth,z_elevation)` 校准出的联合 P95/P99，分别表示攻击点超过
+clean 联合 P95/P99 的比例，不应和边际 `A>1` 比例混淆。
+
+`attack_migration` 还按 clean 点的归属冻结三组：`target_current`、
+`target_history` 和 `non_target_background`。每组累计修改点数以及 XYZ L2 位移的
+mean、P95、max 和 sum；即使攻击后点移出 GT 框，也不会改变所属分组。
+
 #### Radar Object IoU-S loss（适配实验线，非原论文复现）
 
 `--attack_loss object_iou_s` 是针对当前 Radar 对象级漏检任务接入的 IoU-S

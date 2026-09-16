@@ -29,11 +29,15 @@ from radar_attack.adapters.openpcdet import (
 )
 from radar_attack.attacks.gradient import point_cloud_attack
 from radar_attack.attacks.iadv import build_iadv_attack_mask, iadv_rcs_attack
-from radar_attack.attacks.iou_s_original import original_iou_s_point_attack
+from radar_attack.attacks.iou_s_original import (
+    build_iou_s_geometry_reference_mask,
+    original_iou_s_point_attack,
+)
 from radar_attack.attacks.measurement import (
     TEMPORAL_PARAMETER_MODES,
     build_measurement_attack_mask,
     build_temporal_measurement_attack_mask,
+    current_sweep_mask,
     radar_measurement_geometry_attack,
     radar_temporal_measurement_geometry_attack,
 )
@@ -41,6 +45,7 @@ from radar_attack.attacks.objective import ObjectEvidenceObjective
 from radar_attack.attacks.voxel import voxel_attack
 from radar_attack.evaluation import (
     AdversarialPointCloudWriter,
+    AttackMigrationAccumulator,
     DetectionAttackMetrics,
     MeasurementNaturalnessAccumulator,
     MeasurementQ95Reference,
@@ -722,6 +727,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     writer = None
     dataset = dataloader.dataset
     naturalness = None
+    attack_migration = None
     iou_s_loss_trace = []
     if args.attack_domain == 'point':
         reference_path = Path(args.measurement_q95_reference).expanduser()
@@ -729,10 +735,15 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             reference_path = cfg.ROOT_DIR / reference_path
         naturalness_reference = MeasurementQ95Reference.load(reference_path)
         naturalness = MeasurementNaturalnessAccumulator(naturalness_reference)
+        attack_migration = AttackMigrationAccumulator()
         logger.info(
             'Measurement naturalness Q95 reference: %s (gate=1 m)',
             naturalness_reference.path,
         )
+        if not naturalness_reference.has_joint_calibration:
+            logger.warning(
+                'Measurement reference has no clean joint-A P95/P99 calibration'
+            )
     feature_names = get_feature_names(cfg.DATA_CONFIG)
     geometry_reference_class_id = None
     geometry_loss_reference = None
@@ -1311,10 +1322,38 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'frame_id': frame_id,
                     **row,
                 } for row in attack_output.step_metrics)
+            target_membership_mask = build_iadv_attack_mask(
+                original_points,
+                batch_dict,
+                scope='gt_boxes',
+                target_class_ids=target_class_ids,
+                box_margin=0.0,
+            )
+            current_membership_mask = current_sweep_mask(
+                original_points, feature_names
+            )
+            attack_migration.update(
+                original_points,
+                attack_output.adv_points,
+                target_membership_mask,
+                current_membership_mask,
+            )
+            reference_region_mask = None
+            if args.attack_type == 'iou_s_original':
+                reference_region_mask, _ = (
+                    build_iou_s_geometry_reference_mask(
+                        points=original_points,
+                        gt_boxes=batch_dict['gt_boxes'][0],
+                        feature_names=feature_names,
+                        q95_reference=naturalness.reference,
+                        reference_class_id=geometry_reference_class_id,
+                    )
+                )
             naturalness.update(
                 original_points,
                 attack_output.adv_points,
                 batch_dict['frame_id'],
+                reference_region_mask=reference_region_mask,
             )
             if writer is not None:
                 writer.save_batch(
@@ -1385,6 +1424,8 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
         naturalness.write_csv(naturalness_path)
         results['measurement_naturalness'] = naturalness.compute()
         results['measurement_naturalness_file'] = str(naturalness_path)
+    if attack_migration is not None:
+        results['attack_migration'] = attack_migration.compute()
     if iou_s_loss_trace:
         trace_path = output_dir / 'iou_s_original_loss_trace.csv'
         with trace_path.open('w', newline='', encoding='utf-8') as stream:
@@ -1746,10 +1787,33 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             modified['A']['p95'] or 0.0,
             modified['A_exceedance_fraction']['gt_1'] or 0.0,
         )
+        reference_region = naturalness_result['reference_region_covered']
+        reference_joint = reference_region['joint_exceedance_fraction']
+        logger.info(
+            'Car-current reference naturalness: n=%d, A P95=%.4f, '
+            'A max=%.4f, R_joint95=%.4f, R_joint99=%.4f',
+            reference_region['count'],
+            reference_region['A']['p95'] or 0.0,
+            reference_region['A']['max'] or 0.0,
+            reference_joint['R_joint95'] or 0.0,
+            reference_joint['R_joint99'] or 0.0,
+        )
         logger.info(
             'Measurement naturalness per-point CSV: %s',
             results['measurement_naturalness_file'],
         )
+    if 'attack_migration' in results:
+        for group_name, group in results['attack_migration']['groups'].items():
+            logger.info(
+                'Attack migration %s: N_modified=%d, mean/P95/max/sum '
+                'XYZ L2 [m]=%.6f/%.6f/%.6f/%.6f',
+                group_name,
+                group['N_modified'],
+                group['mean_l2_m'] or 0.0,
+                group['p95_l2_m'] or 0.0,
+                group['max_l2_m'] or 0.0,
+                group['sum_l2_m'],
+            )
     logger.info(f'Recall Drop: {results["recall_drop"]:.4f}')
     if 'vod_official' in results:
         vod_results = results['vod_official']
@@ -1919,6 +1983,31 @@ def main():
                 'Measurement A Fraction > 1: '
                 f'{covered["A_exceedance_fraction"]["gt_1"]}\n'
             )
+            reference_region = naturalness_result[
+                'reference_region_covered'
+            ]
+            reference_joint = reference_region[
+                'joint_exceedance_fraction'
+            ]
+            f.write(
+                'Car-current Reference Region '
+                '(N/A_P95/A_max/R_joint95/R_joint99): '
+                f'{reference_region["count"]} / '
+                f'{reference_region["A"]["p95"]} / '
+                f'{reference_region["A"]["max"]} / '
+                f'{reference_joint["R_joint95"]} / '
+                f'{reference_joint["R_joint99"]}\n'
+            )
+            for group_name, group in results['attack_migration'][
+                'groups'
+            ].items():
+                f.write(
+                    f'Attack Migration {group_name} '
+                    '(N_modified/mean/P95/max/sum L2 m): '
+                    f'{group["N_modified"]} / {group["mean_l2_m"]} / '
+                    f'{group["p95_l2_m"]} / {group["max_l2_m"]} / '
+                    f'{group["sum_l2_m"]}\n'
+                )
             f.write(
                 'Measurement Naturalness CSV: '
                 f'{results["measurement_naturalness_file"]}\n'

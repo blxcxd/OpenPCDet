@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "dataset": "View-of-Delft",
   "stage": "Stage 2 GT-motion-compensated mutual-NN clean matched pairs",
   "gate_m": 1.0,
@@ -12,8 +12,10 @@
   "metrics": {
     "range": "abs(delta_r)",
     "azimuth": "abs(delta_s_az)",
-    "elevation": "abs(delta_s_el)"
+    "elevation": "abs(delta_s_el)",
+    "joint_A": "max(abs(delta_r)/q95_range, abs(delta_s_az)/q95_azimuth, abs(delta_s_el)/q95_elevation)"
   },
+  "joint_calibration": "Per clean-point-range bin on the same pass_gate_1 matched pairs; joint_a_q95/q99 are quantiles of joint_A.",
   "bins": [
     {
       "label": "0-10",
@@ -23,7 +25,9 @@
       "matched_pairs": 17131,
       "q95_range_m": 0.24600650084981002,
       "q95_azimuth_m": 0.19937996811451164,
-      "q95_elevation_m": 0.2029648643736921
+      "q95_elevation_m": 0.2029648643736921,
+      "joint_a_q95": 1.4789567380665418,
+      "joint_a_q99": 2.512766965490786
     },
     {
       "label": "10-20",
@@ -33,7 +37,9 @@
       "matched_pairs": 11445,
       "q95_range_m": 0.3545735375956978,
       "q95_azimuth_m": 0.27756751756335674,
-      "q95_elevation_m": 0.3242258978952846
+      "q95_elevation_m": 0.3242258978952846,
+      "joint_a_q95": 1.4631438614081793,
+      "joint_a_q99": 2.1719398008791924
     },
     {
       "label": "20-30",
@@ -43,7 +49,9 @@
       "matched_pairs": 6667,
       "q95_range_m": 0.3944541245492698,
       "q95_azimuth_m": 0.34026600252436473,
-      "q95_elevation_m": 0.3964636414423582
+      "q95_elevation_m": 0.3964636414423582,
+      "joint_a_q95": 1.4949632100708956,
+      "joint_a_q99": 2.0847250138798454
     },
     {
       "label": "30-50",
@@ -53,7 +61,9 @@
       "matched_pairs": 5589,
       "q95_range_m": 0.44793739005566624,
       "q95_azimuth_m": 0.41750945470313106,
-      "q95_elevation_m": 0.4406124905701869
+      "q95_elevation_m": 0.4406124905701869,
+      "joint_a_q95": 1.40843115907092,
+      "joint_a_q99": 1.8821001667652422
     }
   ]
 }

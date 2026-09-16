@@ -24,6 +24,8 @@ class Q95Bin:
     include_upper: bool
     matched_pairs: int
     q95: np.ndarray
+    joint_a_q95: float | None
+    joint_a_q99: float | None
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,21 @@ class MeasurementQ95Reference:
             range_max = float(row['range_max_m'])
             if not np.isfinite([range_min, range_max]).all() or range_min >= range_max:
                 raise ValueError('invalid measurement Q95 range bin')
+            joint_a_q95 = row.get('joint_a_q95')
+            joint_a_q99 = row.get('joint_a_q99')
+            if (joint_a_q95 is None) != (joint_a_q99 is None):
+                raise ValueError(
+                    'joint A calibration requires both Q95 and Q99'
+                )
+            if joint_a_q95 is not None:
+                joint_a_q95 = float(joint_a_q95)
+                joint_a_q99 = float(joint_a_q99)
+                if (
+                    not np.isfinite([joint_a_q95, joint_a_q99]).all()
+                    or joint_a_q95 <= 0
+                    or joint_a_q99 < joint_a_q95
+                ):
+                    raise ValueError('invalid joint A Q95/Q99 calibration')
             bins.append(Q95Bin(
                 label=str(row['label']),
                 range_min_m=range_min,
@@ -67,6 +84,8 @@ class MeasurementQ95Reference:
                 include_upper=bool(row.get('include_upper', False)),
                 matched_pairs=int(row['matched_pairs']),
                 q95=q95,
+                joint_a_q95=joint_a_q95,
+                joint_a_q99=joint_a_q99,
             ))
         bins.sort(key=lambda row: row.range_min_m)
         if not bins:
@@ -86,10 +105,16 @@ class MeasurementQ95Reference:
                 'q95_range_m': float(row.q95[0]),
                 'q95_azimuth_m': float(row.q95[1]),
                 'q95_elevation_m': float(row.q95[2]),
+                'joint_a_q95': row.joint_a_q95,
+                'joint_a_q99': row.joint_a_q99,
             }
             for row in bins
         ]
         return cls(path=path, metadata=metadata, bins=tuple(bins))
+
+    @property
+    def has_joint_calibration(self) -> bool:
+        return all(row.joint_a_q95 is not None for row in self.bins)
 
     def lookup(self, clean_range_m: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return Q95 triplets, bin indices, and coverage for clean ranges."""
@@ -113,6 +138,21 @@ class MeasurementQ95Reference:
             bin_indices[selected] = index
         covered = bin_indices >= 0
         return q95, bin_indices, covered
+
+    def lookup_joint_a(
+        self, bin_indices: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return clean joint-A P95/P99 thresholds for assigned bins."""
+        bin_indices = np.asarray(bin_indices)
+        q95 = np.full(bin_indices.size, np.nan, dtype=np.float64)
+        q99 = np.full(bin_indices.size, np.nan, dtype=np.float64)
+        for index, row in enumerate(self.bins):
+            if row.joint_a_q95 is None:
+                continue
+            selected = bin_indices == index
+            q95[selected] = row.joint_a_q95
+            q99[selected] = row.joint_a_q99
+        return q95, q99
 
 
 def point_measurement_naturalness(
@@ -165,6 +205,10 @@ def point_measurement_naturalness(
     z[covered] = x[covered] / q95[covered]
     anomaly = np.full(clean_range.size, np.nan, dtype=np.float64)
     anomaly[covered] = np.max(z[covered], axis=1)
+    joint_a_q95, joint_a_q99 = reference.lookup_joint_a(bin_indices)
+    joint_calibrated = (
+        covered & np.isfinite(joint_a_q95) & np.isfinite(joint_a_q99)
+    )
     max_dimension = np.full(clean_range.size, -1, dtype=np.int8)
     max_dimension[covered] = np.argmax(z[covered], axis=1).astype(np.int8)
     modified = np.max(x, axis=1) > float(change_tolerance_m)
@@ -179,6 +223,9 @@ def point_measurement_naturalness(
         'q95': q95,
         'z': z,
         'anomaly': anomaly,
+        'joint_a_q95': joint_a_q95,
+        'joint_a_q99': joint_a_q99,
+        'joint_calibrated': joint_calibrated,
         'max_dimension': max_dimension,
     }
 
@@ -212,6 +259,7 @@ class MeasurementNaturalnessAccumulator:
         clean_points: torch.Tensor,
         adversarial_points: torch.Tensor,
         frame_ids: Sequence,
+        reference_region_mask: torch.Tensor | None = None,
     ) -> None:
         values = point_measurement_naturalness(
             clean_points, adversarial_points, self.reference
@@ -228,6 +276,16 @@ class MeasurementNaturalnessAccumulator:
             selected = np.flatnonzero(batch_indices == batch_index)
             local_indices[selected] = np.arange(selected.size)
         values['point_index'] = local_indices
+        if reference_region_mask is None:
+            values['reference_region'] = np.zeros(
+                batch_indices.size, dtype=bool
+            )
+        else:
+            if reference_region_mask.shape != (batch_indices.size,):
+                raise ValueError('reference_region_mask must have shape [N]')
+            values['reference_region'] = (
+                reference_region_mask.detach().bool().cpu().numpy()
+            )
         self.batches.append(values)
 
     def _combined(self) -> Dict[str, np.ndarray]:
@@ -251,6 +309,9 @@ class MeasurementNaturalnessAccumulator:
             anomaly = values['anomaly'][mask]
             dimensions = values['max_dimension'][mask]
             count = int(mask.sum())
+            joint_mask = mask & values['joint_calibrated']
+            joint_count = int(joint_mask.sum())
+            joint_anomaly = values['anomaly'][joint_mask]
             return {
                 'count': count,
                 'z': {
@@ -262,6 +323,15 @@ class MeasurementNaturalnessAccumulator:
                     'gt_1': float(np.mean(anomaly > 1)) if count else None,
                     'gt_2': float(np.mean(anomaly > 2)) if count else None,
                     'gt_5': float(np.mean(anomaly > 5)) if count else None,
+                },
+                'joint_calibrated_count': joint_count,
+                'joint_exceedance_fraction': {
+                    'R_joint95': float(np.mean(
+                        joint_anomaly > values['joint_a_q95'][joint_mask]
+                    )) if joint_count else None,
+                    'R_joint99': float(np.mean(
+                        joint_anomaly > values['joint_a_q99'][joint_mask]
+                    )) if joint_count else None,
                 },
                 'dimension_gt_1_fraction': {
                     name: float(np.mean(z[:, index] > 1)) if count else None
@@ -282,6 +352,8 @@ class MeasurementNaturalnessAccumulator:
             }
 
         total = int(values['clean_range_m'].size)
+        reference_region = values['reference_region'] & covered
+        reference_region_modified = reference_region & modified
         return {
             'reference': self.reference.metadata,
             'total_points': total,
@@ -292,6 +364,10 @@ class MeasurementNaturalnessAccumulator:
             'modified_covered_points': int(modified_covered.sum()),
             'all_covered': subset_summary(covered),
             'modified_covered': subset_summary(modified_covered),
+            'reference_region_covered': subset_summary(reference_region),
+            'reference_region_modified_covered': subset_summary(
+                reference_region_modified
+            ),
             'by_range_bin': by_range_bin,
         }
 
@@ -306,6 +382,8 @@ class MeasurementNaturalnessAccumulator:
             'x_range_m', 'x_azimuth_m', 'x_elevation_m',
             'q95_range_m', 'q95_azimuth_m', 'q95_elevation_m',
             'z_range', 'z_azimuth', 'z_elevation', 'A', 'max_dimension',
+            'joint_A_q95', 'joint_A_q99', 'joint95_exceeded',
+            'joint99_exceeded', 'reference_region',
         ]
         with gzip.open(path, 'wt', newline='', encoding='utf-8') as stream:
             writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -341,5 +419,26 @@ class MeasurementNaturalnessAccumulator:
                     'A': values['anomaly'][index] if covered else '',
                     'max_dimension': (
                         MEASUREMENT_DIMENSIONS[maximum] if covered else ''
+                    ),
+                    'joint_A_q95': (
+                        values['joint_a_q95'][index]
+                        if values['joint_calibrated'][index] else ''
+                    ),
+                    'joint_A_q99': (
+                        values['joint_a_q99'][index]
+                        if values['joint_calibrated'][index] else ''
+                    ),
+                    'joint95_exceeded': (
+                        int(values['anomaly'][index]
+                            > values['joint_a_q95'][index])
+                        if values['joint_calibrated'][index] else ''
+                    ),
+                    'joint99_exceeded': (
+                        int(values['anomaly'][index]
+                            > values['joint_a_q99'][index])
+                        if values['joint_calibrated'][index] else ''
+                    ),
+                    'reference_region': int(
+                        values['reference_region'][index]
                     ),
                 })

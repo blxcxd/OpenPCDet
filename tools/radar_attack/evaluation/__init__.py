@@ -1,3 +1,4 @@
+from .attack_migration import AttackMigrationAccumulator
 from .metrics import DetectionAttackMetrics
 from .measurement_naturalness import (
     MeasurementNaturalnessAccumulator,
@@ -24,6 +25,7 @@ from .vod import (
 
 __all__ = [
     'AdversarialPointCloudWriter',
+    'AttackMigrationAccumulator',
     'DetectionAttackMetrics',
     'MeasurementNaturalnessAccumulator',
     'MeasurementQ95Reference',
