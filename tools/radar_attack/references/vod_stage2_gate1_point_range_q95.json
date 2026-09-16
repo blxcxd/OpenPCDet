@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "dataset": "View-of-Delft",
+  "stage": "Stage 2 GT-motion-compensated mutual-NN clean matched pairs",
+  "gate_m": 1.0,
+  "quantile": 0.95,
+  "units": "m",
+  "source_file": "output/vod_car_statistics/stage2_matching/mnn_candidates.csv.gz",
+  "source_sha256": "43b94168e29c51b6124579a1e53f86762fa968970e5237dc047e2a4923d7c798",
+  "bin_basis": "clean_point_range",
+  "reference_scope": "Car GT-box-associated current-scan points",
+  "metrics": {
+    "range": "abs(delta_r)",
+    "azimuth": "abs(delta_s_az)",
+    "elevation": "abs(delta_s_el)"
+  },
+  "bins": [
+    {
+      "label": "0-10",
+      "range_min_m": 0.0,
+      "range_max_m": 10.0,
+      "include_upper": false,
+      "matched_pairs": 17131,
+      "q95_range_m": 0.24600650084981002,
+      "q95_azimuth_m": 0.19937996811451164,
+      "q95_elevation_m": 0.2029648643736921
+    },
+    {
+      "label": "10-20",
+      "range_min_m": 10.0,
+      "range_max_m": 20.0,
+      "include_upper": false,
+      "matched_pairs": 11445,
+      "q95_range_m": 0.3545735375956978,
+      "q95_azimuth_m": 0.27756751756335674,
+      "q95_elevation_m": 0.3242258978952846
+    },
+    {
+      "label": "20-30",
+      "range_min_m": 20.0,
+      "range_max_m": 30.0,
+      "include_upper": false,
+      "matched_pairs": 6667,
+      "q95_range_m": 0.3944541245492698,
+      "q95_azimuth_m": 0.34026600252436473,
+      "q95_elevation_m": 0.3964636414423582
+    },
+    {
+      "label": "30-50",
+      "range_min_m": 30.0,
+      "range_max_m": 50.0,
+      "include_upper": true,
+      "matched_pairs": 5589,
+      "q95_range_m": 0.44793739005566624,
+      "q95_azimuth_m": 0.41750945470313106,
+      "q95_elevation_m": 0.4406124905701869
+    }
+  ]
+}

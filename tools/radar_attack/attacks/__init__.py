@@ -13,10 +13,12 @@ from .iadv import (
     rcs_column,
 )
 from .iou_s_original import (
+    build_iou_s_geometry_reference_mask,
     directed_chamfer_squared,
     original_iou_s_detection_loss,
     original_iou_s_point_attack,
     prediction_set_retention,
+    radar_geometry_q95_hinge_loss,
     symmetric_chamfer_squared,
 )
 from .measurement import (
@@ -67,6 +69,8 @@ __all__ = [
     'rcs_column',
     'directed_chamfer_squared',
     'symmetric_chamfer_squared',
+    'build_iou_s_geometry_reference_mask',
+    'radar_geometry_q95_hinge_loss',
     'original_iou_s_detection_loss',
     'original_iou_s_point_attack',
     'prediction_set_retention',

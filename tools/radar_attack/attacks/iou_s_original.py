@@ -17,12 +17,120 @@ BPDA convention used by the other raw-point attacks in this repository.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 
 from .base import AttackOutput, restore_attack_modes
+from .iadv import assign_points_to_oriented_boxes
+from .measurement import (
+    cartesian_to_radar_measurement,
+    current_sweep_mask,
+)
 from .objective import differentiable_oriented_iou3d
+
+
+def build_iou_s_geometry_reference_mask(
+    points: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    feature_names: Sequence[str],
+    q95_reference,
+    reference_class_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Freeze the points for which the Car/current-scan Q95 is applicable.
+
+    The attack itself remains full-scene.  This helper only identifies clean
+    current-sweep points inside a valid reference-class GT box whose clean
+    range is covered by the Stage 2 reference.  It also materializes each
+    point's fixed Q95 triplet on the attack device.
+    """
+    if points.ndim != 2 or points.shape[1] < 4:
+        raise ValueError('points must contain batch index and XYZ')
+    if gt_boxes.ndim != 2 or gt_boxes.shape[1] < 8:
+        raise ValueError('gt_boxes must have shape [M, >=8] with class ids')
+    if int(reference_class_id) <= 0:
+        raise ValueError('reference_class_id must be a positive class id')
+    if float(q95_reference.metadata.get('gate_m', -1)) != 1.0:
+        raise ValueError('IoU-S geometry loss requires a 1 m gate reference')
+
+    valid_boxes = (gt_boxes[:, 3:6] > 0).all(dim=1)
+    valid_boxes &= gt_boxes[:, -1].long() == int(reference_class_id)
+    boxes = gt_boxes[valid_boxes, :7]
+    associated = assign_points_to_oriented_boxes(
+        points[:, 1:4], boxes
+    ) >= 0
+    current = current_sweep_mask(points, feature_names)
+    clean_range = torch.linalg.vector_norm(points[:, 1:4], dim=1)
+    covered = torch.zeros_like(clean_range, dtype=torch.bool)
+    point_q95 = torch.zeros(
+        (points.shape[0], 3), dtype=points.dtype, device=points.device
+    )
+    for row in q95_reference.bins:
+        upper = (
+            clean_range <= float(row.range_max_m)
+            if row.include_upper
+            else clean_range < float(row.range_max_m)
+        )
+        selected = (clean_range >= float(row.range_min_m)) & upper
+        if (covered & selected).any():
+            raise ValueError('measurement Q95 reference bins overlap')
+        covered |= selected
+        point_q95[selected] = torch.as_tensor(
+            row.q95, dtype=points.dtype, device=points.device
+        )
+    reference_mask = (
+        associated & current & covered & torch.isfinite(clean_range)
+        & (clean_range > 1e-12)
+    )
+    if reference_mask.any() and (
+        ~torch.isfinite(point_q95[reference_mask]).all()
+        or (point_q95[reference_mask] <= 0).any()
+    ):
+        raise ValueError('reference points require finite positive Q95 values')
+    return reference_mask, point_q95
+
+
+def radar_geometry_q95_hinge_loss(
+    clean_xyz: torch.Tensor,
+    adversarial_xyz: torch.Tensor,
+    reference_mask: torch.Tensor,
+    point_q95: torch.Tensor,
+) -> torch.Tensor:
+    """Mean squared hinge above the three marginal clean Q95 scales."""
+    if clean_xyz.shape != adversarial_xyz.shape or clean_xyz.ndim != 2:
+        raise ValueError('clean/adversarial XYZ must have equal [N, 3] shape')
+    if clean_xyz.shape[1] != 3:
+        raise ValueError('clean/adversarial XYZ must have three columns')
+    if reference_mask.shape != (clean_xyz.shape[0],):
+        raise ValueError('reference_mask must have shape [N]')
+    if point_q95.shape != clean_xyz.shape:
+        raise ValueError('point_q95 must have shape [N, 3]')
+    if not reference_mask.any():
+        return adversarial_xyz.sum() * 0.0
+
+    clean_reference_xyz = clean_xyz[reference_mask]
+    adversarial_reference_xyz = adversarial_xyz[reference_mask]
+    clean_measurement = cartesian_to_radar_measurement(clean_reference_xyz)
+    adversarial_measurement = cartesian_to_radar_measurement(
+        adversarial_reference_xyz
+    )
+    delta = adversarial_measurement - clean_measurement
+    delta_azimuth = torch.atan2(torch.sin(delta[:, 1]), torch.cos(delta[:, 1]))
+    mean_range = 0.5 * (
+        clean_measurement[:, 0] + adversarial_measurement[:, 0]
+    )
+    mean_elevation = 0.5 * (
+        clean_measurement[:, 2] + adversarial_measurement[:, 2]
+    )
+    measurement_displacement = torch.stack((
+        delta[:, 0].abs(),
+        mean_range * torch.cos(mean_elevation) * delta_azimuth.abs(),
+        mean_range * delta[:, 2].abs(),
+    ), dim=1)
+    z = (
+        measurement_displacement / point_q95[reference_mask]
+    )
+    return torch.relu(z - 1.0).square().sum(dim=1).mean()
 
 
 def directed_chamfer_squared(
@@ -186,6 +294,10 @@ def original_iou_s_point_attack(
     log_epsilon: float = 1e-8,
     chamfer_chunk_size: int = 1024,
     return_policy: str = 'joint_best',
+    geometry_weight: float = 0.0,
+    geometry_reference=None,
+    feature_names: Sequence[str] | None = None,
+    geometry_reference_class_id: int | None = None,
 ) -> AttackOutput:
     """Port the official IoU-S full-scene XYZ perturbation attack.
 
@@ -210,6 +322,15 @@ def original_iou_s_point_attack(
         raise ValueError('chamfer_chunk_size must be positive')
     if return_policy not in {'joint_best', 'last'}:
         raise ValueError('return_policy must be joint_best or last')
+    if geometry_weight < 0:
+        raise ValueError('geometry_weight must be non-negative')
+    geometry_enabled = geometry_reference is not None
+    if geometry_enabled and (
+        feature_names is None or geometry_reference_class_id is None
+    ):
+        raise ValueError(
+            'geometry reference requires feature_names and reference class id'
+        )
 
     original = batch_dict['points'].detach().clone()
     if original.ndim != 2 or original.shape[1] < 4:
@@ -218,6 +339,23 @@ def original_iou_s_point_attack(
         raise ValueError('original IoU-S requires a non-empty point cloud')
     if not torch.equal(original[:, 0], torch.zeros_like(original[:, 0])):
         raise ValueError('batch_size=1 points must all have batch index zero')
+
+    if geometry_enabled:
+        geometry_reference_mask, geometry_point_q95 = (
+            build_iou_s_geometry_reference_mask(
+                points=original,
+                gt_boxes=batch_dict['gt_boxes'][0],
+                feature_names=feature_names,
+                q95_reference=geometry_reference,
+                reference_class_id=geometry_reference_class_id,
+            )
+        )
+    else:
+        geometry_reference_mask = torch.zeros(
+            original.shape[0], dtype=torch.bool, device=original.device
+        )
+        geometry_point_q95 = torch.zeros_like(original[:, 1:4])
+    geometry_reference_points = int(geometry_reference_mask.sum().item())
 
     xyz = original[:, 1:4].detach().clone()
     if initial_noise > 0:
@@ -232,11 +370,17 @@ def original_iou_s_point_attack(
     best_distance = float('inf')
     best_total = float('inf')
     best_attack = float('inf')
+    best_geometry = float('inf')
+    best_weighted_geometry = float('inf')
+    best_base_total = float('inf')
     best_step = 0
     best_updates = 0
     first_distance = 0.0
     first_attack = 0.0
     first_total = 0.0
+    first_geometry = 0.0
+    first_weighted_geometry = 0.0
+    first_base_total = 0.0
     prediction_total = 0
     pair_total = 0
     nonfinite_steps = 0
@@ -246,6 +390,7 @@ def original_iou_s_point_attack(
     switch_count = 0
     prediction_count_change_count = 0
     previous_predictions = None
+    step_metrics = []
 
     try:
         for step_index in range(steps):
@@ -279,14 +424,28 @@ def original_iou_s_point_attack(
                         != current_predictions['pred_boxes'].shape[0]):
                     prediction_count_change_count += 1
             previous_predictions = current_predictions
-            chamfer = symmetric_chamfer_squared(
-                xyz, original[:, 1:4], chunk_size=chamfer_chunk_size
+            if distance_weight > 0:
+                chamfer = symmetric_chamfer_squared(
+                    xyz, original[:, 1:4], chunk_size=chamfer_chunk_size
+                )
+                global_l2 = torch.sqrt(
+                    (xyz - original[:, 1:4]).square().sum() + 1e-4
+                )
+                distance_loss = chamfer + global_l2
+            else:
+                # A true ablation: do not construct or evaluate either
+                # distance regularizer when its weight is zero.
+                distance_loss = xyz.sum() * 0.0
+            geometry_loss = radar_geometry_q95_hinge_loss(
+                original[:, 1:4],
+                xyz,
+                geometry_reference_mask,
+                geometry_point_q95,
             )
-            global_l2 = torch.sqrt(
-                (xyz - original[:, 1:4]).square().sum() + 1e-4
-            )
-            distance_loss = chamfer + global_l2
-            total_loss = attack_loss + float(distance_weight) * distance_loss
+            weighted_distance_loss = float(distance_weight) * distance_loss
+            weighted_geometry_loss = float(geometry_weight) * geometry_loss
+            base_total_loss = attack_loss + weighted_distance_loss
+            total_loss = base_total_loss + weighted_geometry_loss
             gradient = torch.autograd.grad(total_loss, xyz)[0]
             if not torch.isfinite(total_loss) or not torch.isfinite(gradient).all():
                 nonfinite_steps += 1
@@ -298,7 +457,35 @@ def original_iou_s_point_attack(
 
             distance_value = float(distance_loss.detach().item())
             attack_value = float(attack_loss.detach().item())
+            geometry_value = float(geometry_loss.detach().item())
+            weighted_geometry_value = float(
+                weighted_geometry_loss.detach().item()
+            )
+            weighted_distance_value = float(
+                weighted_distance_loss.detach().item()
+            )
+            base_total_value = float(base_total_loss.detach().item())
             total_value = float(total_loss.detach().item())
+            step_metrics.append({
+                'step': float(step_index + 1),
+                'prediction_count': float(
+                    predictions[0]['pred_boxes'].shape[0]
+                ),
+                'pair_count': float(pair_count),
+                'iou_s_detection_loss': attack_value,
+                'iou_s_detection_loss_per_pair': (
+                    attack_value / max(pair_count, 1)
+                ),
+                'distance_loss': distance_value,
+                'weighted_distance_loss': weighted_distance_value,
+                'iou_s_base_total_loss': base_total_value,
+                'geometry_loss': geometry_value,
+                'weighted_geometry_loss': weighted_geometry_value,
+                'total_loss': total_value,
+                'geometry_reference_points': float(
+                    geometry_reference_points
+                ),
+            })
             prediction_total += int(predictions[0]['pred_boxes'].shape[0])
             pair_total += pair_count
             if predictions[0]['pred_boxes'].shape[0] == 0:
@@ -307,11 +494,24 @@ def original_iou_s_point_attack(
                 first_distance = distance_value
                 first_attack = attack_value
                 first_total = total_value
-            # Preserve the reference implementation's joint improvement rule.
-            if distance_value < best_distance and total_value < best_total:
+                first_geometry = geometry_value
+                first_weighted_geometry = weighted_geometry_value
+                first_base_total = base_total_value
+            # Preserve the reference implementation's joint improvement rule
+            # when its distance term is enabled. Without that term, select by
+            # the actual optimized objective instead of getting stuck at step 1
+            # because every distance value is exactly zero.
+            distance_improved = (
+                distance_value < best_distance
+                if distance_weight > 0 else True
+            )
+            if distance_improved and total_value < best_total:
                 best_distance = distance_value
                 best_total = total_value
                 best_attack = attack_value
+                best_geometry = geometry_value
+                best_weighted_geometry = weighted_geometry_value
+                best_base_total = base_total_value
                 best_step = step_index + 1
                 best_updates += 1
                 best_points = original.clone()
@@ -320,7 +520,9 @@ def original_iou_s_point_attack(
         last_points = original.clone()
         last_points[:, 1:4] = xyz.detach()
 
-        def endpoint_losses(points: torch.Tensor) -> tuple[float, float, float, int]:
+        def endpoint_losses(
+            points: torch.Tensor,
+        ) -> tuple[float, float, float, float, float, int]:
             endpoint_topology = voxelizer.topology(points)
             endpoint_voxels = voxelizer.materialize(points, endpoint_topology)
             endpoint_batch = dict(batch_dict)
@@ -331,22 +533,39 @@ def original_iou_s_point_attack(
                 endpoint_attack, endpoint_pairs = original_iou_s_detection_loss(
                     endpoint_predictions[0], batch_dict['gt_boxes'][0], log_epsilon
                 )
-                endpoint_chamfer = symmetric_chamfer_squared(
-                    points[:, 1:4], original[:, 1:4],
-                    chunk_size=chamfer_chunk_size,
-                )
-                endpoint_global_l2 = torch.sqrt(
-                    (points[:, 1:4] - original[:, 1:4]).square().sum()
-                    + 1e-4
-                )
-                endpoint_distance = endpoint_chamfer + endpoint_global_l2
-                endpoint_total = (
+                if distance_weight > 0:
+                    endpoint_chamfer = symmetric_chamfer_squared(
+                        points[:, 1:4], original[:, 1:4],
+                        chunk_size=chamfer_chunk_size,
+                    )
+                    endpoint_global_l2 = torch.sqrt(
+                        (points[:, 1:4] - original[:, 1:4]).square().sum()
+                        + 1e-4
+                    )
+                    endpoint_distance = (
+                        endpoint_chamfer + endpoint_global_l2
+                    )
+                else:
+                    endpoint_distance = points[:, 1:4].sum() * 0.0
+                endpoint_base_total = (
                     endpoint_attack
                     + float(distance_weight) * endpoint_distance
+                )
+                endpoint_geometry = radar_geometry_q95_hinge_loss(
+                    original[:, 1:4],
+                    points[:, 1:4],
+                    geometry_reference_mask,
+                    geometry_point_q95,
+                )
+                endpoint_total = (
+                    endpoint_base_total
+                    + float(geometry_weight) * endpoint_geometry
                 )
             return (
                 float(endpoint_attack.item()),
                 float(endpoint_distance.item()),
+                float(endpoint_base_total.item()),
+                float(endpoint_geometry.item()),
                 float(endpoint_total.item()),
                 int(endpoint_pairs),
             )
@@ -392,6 +611,9 @@ def original_iou_s_point_attack(
         'iou_s_original_mean_pairs_per_step': pair_total / steps,
         'iou_s_original_best_attack_loss': best_attack,
         'iou_s_original_best_distance_loss': best_distance,
+        'iou_s_original_best_base_total_loss': best_base_total,
+        'iou_s_original_best_geometry_loss': best_geometry,
+        'iou_s_original_best_weighted_geometry_loss': best_weighted_geometry,
         'iou_s_original_best_total_loss': best_total,
         'iou_s_original_best_step': float(best_step),
         'iou_s_original_best_step_fraction': best_step / steps,
@@ -400,21 +622,39 @@ def original_iou_s_point_attack(
         'iou_s_original_best_step_le_100': float(best_step <= 100),
         'iou_s_original_first_attack_loss': first_attack,
         'iou_s_original_first_distance_loss': first_distance,
+        'iou_s_original_first_base_total_loss': first_base_total,
+        'iou_s_original_first_geometry_loss': first_geometry,
+        'iou_s_original_first_weighted_geometry_loss': (
+            first_weighted_geometry
+        ),
         'iou_s_original_first_total_loss': first_total,
         'iou_s_original_joint_best_endpoint_attack_loss': joint_best_endpoint[0],
         'iou_s_original_joint_best_endpoint_distance_loss': joint_best_endpoint[1],
-        'iou_s_original_joint_best_endpoint_total_loss': joint_best_endpoint[2],
+        'iou_s_original_joint_best_endpoint_base_total_loss': (
+            joint_best_endpoint[2]
+        ),
+        'iou_s_original_joint_best_endpoint_geometry_loss': (
+            joint_best_endpoint[3]
+        ),
+        'iou_s_original_joint_best_endpoint_total_loss': joint_best_endpoint[4],
         'iou_s_original_last_attack_loss': last_endpoint[0],
         'iou_s_original_last_distance_loss': last_endpoint[1],
-        'iou_s_original_last_total_loss': last_endpoint[2],
+        'iou_s_original_last_base_total_loss': last_endpoint[2],
+        'iou_s_original_last_geometry_loss': last_endpoint[3],
+        'iou_s_original_last_total_loss': last_endpoint[4],
         'iou_s_original_selected_attack_loss': selected_endpoint[0],
         'iou_s_original_selected_distance_loss': selected_endpoint[1],
-        'iou_s_original_selected_total_loss': selected_endpoint[2],
+        'iou_s_original_selected_base_total_loss': selected_endpoint[2],
+        'iou_s_original_selected_geometry_loss': selected_endpoint[3],
+        'iou_s_original_selected_weighted_geometry_loss': (
+            float(geometry_weight) * selected_endpoint[3]
+        ),
+        'iou_s_original_selected_total_loss': selected_endpoint[4],
         'iou_s_original_joint_best_endpoint_attack_loss_per_pair': (
-            joint_best_endpoint[0] / max(joint_best_endpoint[3], 1)
+            joint_best_endpoint[0] / max(joint_best_endpoint[5], 1)
         ),
         'iou_s_original_last_attack_loss_per_pair': (
-            last_endpoint[0] / max(last_endpoint[3], 1)
+            last_endpoint[0] / max(last_endpoint[5], 1)
         ),
         'iou_s_original_mean_prediction_retention': (
             retention_sum / max(transition_count, 1)
@@ -431,9 +671,20 @@ def original_iou_s_point_attack(
         'iou_s_original_return_last': float(return_policy == 'last'),
         'iou_s_original_nonfinite_gradient_steps': float(nonfinite_steps),
         'iou_s_original_hard_epsilon_projection': 0.0,
+        'iou_s_original_distance_regularizer_enabled': float(
+            distance_weight > 0
+        ),
+        'iou_s_original_geometry_weight': float(geometry_weight),
+        'iou_s_original_geometry_reference_points': float(
+            geometry_reference_points
+        ),
+        'iou_s_original_geometry_reference_enabled': float(
+            geometry_enabled
+        ),
     }
     return AttackOutput(
         adv_points=adversarial,
         model_inputs=voxel_data,
         stats=stats,
+        step_metrics=step_metrics,
     )

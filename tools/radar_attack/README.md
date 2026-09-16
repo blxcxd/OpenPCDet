@@ -348,6 +348,43 @@ python tools/radar_attack/run_attack.py \
 最大/平均 XYZ 位移、Chamfer/L2 距离和修改点数审计。参考实现：
 [haichen-ber/IoU-S-Attack](https://github.com/haichen-ber/IoU-S-Attack)。
 
+##### Car/current-scan Q95 几何约束
+
+`--iou_s_geo_weight` 在实验线 A 的完整全场景攻击变量上增加 Radar 几何软约束，
+不会缩小可攻击点范围。参考掩码在 clean 点云上冻结，只包含 Car GT 框关联、
+`time=0` 且 clean range 位于 `0--50 m` 的点。框外点、其他类别点、历史 sweep
+和参考距离外的点仍由原始 IoU-S 优化，但不使用 Car/current-scan 统计约束。
+
+对参考点计算三个 measurement displacement 的 Stage 2 Q95 归一化值，并使用：
+
+```text
+L_geo = mean_over_reference_points(
+    relu(z_range - 1)^2
+  + relu(z_azimuth - 1)^2
+  + relu(z_elevation - 1)^2
+)
+L_total = L_IoU-S-detection + iou_s_geo_weight * L_geo
+```
+
+Q95 sweep 配置明确设置 `iou_s_original_distance_weight: 0`，因此不会计算或使用
+双向 Chamfer 和全局 XYZ L2；此时 `lambda_g=0` 是无距离正则的 IoU-S 检测
+loss 基线，不再是原论文完整目标。`L_geo` 的分母严格是参考点数，不是全场景
+点数；没有合法参考点的场景令该项为零。默认参考
+`vod_stage2_gate1_point_range_q95.json` 来自 1 m MNN clean pairs，并按 clean
+点自身 range 重新分桶。
+
+每次运行会输出 `iou_s_original_loss_trace.csv`，逐帧、逐步保存检测 loss、
+每对预测 loss、距离项、原始/加权几何项和总 loss。先运行 10 帧 lambda sweep：
+
+```bash
+python tools/radar_attack/run_experiments.py \
+    tools/radar_attack/configs/vod_iou_s_geo_q95_screen.yml
+```
+
+其中比较 `iou_s_geo_weight = 0, 0.01, 0.1, 1`。应以轨迹中的
+`weighted_geometry_loss` 相对 `iou_s_detection_loss` 的实际比例判断权重，而
+不能只比较名义 lambda。
+
 #### Radar Object IoU-S loss（适配实验线，非原论文复现）
 
 `--attack_loss object_iou_s` 是针对当前 Radar 对象级漏检任务接入的 IoU-S
@@ -1069,6 +1106,8 @@ python tools/radar_attack/run_experiments.py \
 | `--iou_s_original_lr` | `0.01` | 原论文 point perturbation 的 Adam 学习率 |
 | `--iou_s_original_init_noise` | `0.01` | 原论文正向均匀 XYZ 初始噪声幅度 |
 | `--iou_s_original_distance_weight` | `1.0` | 原论文 Chamfer 与全局 XYZ L2 距离项权重 |
+| `--iou_s_geo_weight` | `0.0` | Car/current-scan Stage 2 Q95 几何平方 hinge 权重 |
+| `--iou_s_geo_reference` | point-range 1 m MNN JSON | IoU-S 几何约束使用的 clean Q95 参考 |
 | `--iadv_neighbor_scope` | `object` | I-ADV 的逐车、旧攻击点并集或全场景邻域/融合范围 |
 | `--save_adv` | 关闭 | 保存原始对抗点云，仅支持 point |
 | `--num_samples` | 全部 | 限制攻击样本数，用于调试 |

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ class AttackOutput:
     adv_points: torch.Tensor
     model_inputs: Dict[str, torch.Tensor]
     stats: Dict[str, float]
+    step_metrics: Optional[List[Dict[str, float]]] = None
 
 
 def set_attack_mode(model: nn.Module) -> Dict[nn.Module, bool]:

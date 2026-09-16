@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import csv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
@@ -331,6 +332,24 @@ def parse_config():
                         help='positive uniform XYZ initialization amplitude')
     parser.add_argument('--iou_s_original_distance_weight', type=float, default=1.0,
                         help='weight of Chamfer plus global XYZ L2 regularization')
+    parser.add_argument(
+        '--iou_s_geo_weight', type=float, default=0.0,
+        help=(
+            'lambda_g for the Car/current-scan Stage-2-Q95 squared-hinge '
+            'geometry loss; zero reproduces the IoU-S baseline'
+        ),
+    )
+    parser.add_argument(
+        '--iou_s_geo_reference',
+        default=(
+            'tools/radar_attack/references/'
+            'vod_stage2_gate1_point_range_q95.json'
+        ),
+        help=(
+            'Stage 2 1 m MNN Q95 reference used by the IoU-S geometry '
+            'penalty; bins must use clean-point range'
+        ),
+    )
     parser.add_argument('--iou_s_original_log_epsilon', type=float, default=1e-8,
                         help='official numerical epsilon inside IoU-S logarithms')
     parser.add_argument('--iou_s_original_chamfer_chunk_size', type=int,
@@ -438,6 +457,8 @@ def parse_config():
         parser.error('--iou_s_original_init_noise must be non-negative')
     if args.iou_s_original_distance_weight < 0:
         parser.error('--iou_s_original_distance_weight must be non-negative')
+    if args.iou_s_geo_weight < 0:
+        parser.error('--iou_s_geo_weight must be non-negative')
     if not 0 < args.iou_s_original_log_epsilon < 1:
         parser.error('--iou_s_original_log_epsilon must be in (0, 1)')
     if args.iou_s_original_chamfer_chunk_size <= 0:
@@ -701,6 +722,7 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
     writer = None
     dataset = dataloader.dataset
     naturalness = None
+    iou_s_loss_trace = []
     if args.attack_domain == 'point':
         reference_path = Path(args.measurement_q95_reference).expanduser()
         if not reference_path.is_absolute():
@@ -712,6 +734,29 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             naturalness_reference.path,
         )
     feature_names = get_feature_names(cfg.DATA_CONFIG)
+    geometry_reference_class_id = None
+    geometry_loss_reference = None
+    if args.attack_type == 'iou_s_original':
+        if 'Car' not in dataset.class_names:
+            raise ValueError(
+                'IoU-S Stage 2 geometry loss requires class "Car" in the '
+                'dataset class names'
+            )
+        geometry_reference_class_id = dataset.class_names.index('Car') + 1
+        geometry_reference_path = Path(args.iou_s_geo_reference).expanduser()
+        if not geometry_reference_path.is_absolute():
+            geometry_reference_path = cfg.ROOT_DIR / geometry_reference_path
+        geometry_loss_reference = MeasurementQ95Reference.load(
+            geometry_reference_path
+        )
+        if geometry_loss_reference.metadata.get('bin_basis') != 'clean_point_range':
+            raise ValueError(
+                'IoU-S geometry reference must use clean_point_range bins'
+            )
+        logger.info(
+            'IoU-S geometry Q95 reference: %s (gate=1 m, Car/current)',
+            geometry_loss_reference.path,
+        )
     target_class_names, target_class_ids, object_iou_thresholds = (
         resolve_object_targets(args, dataset.class_names)
     )
@@ -885,6 +930,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                     'iou_s_original_distance_weight': (
                         args.iou_s_original_distance_weight
                     ),
+                    'iou_s_geo_weight': args.iou_s_geo_weight,
+                    'iou_s_geo_reference': str(
+                        geometry_loss_reference.path
+                    ) if geometry_loss_reference is not None else None,
                     'iou_s_original_log_epsilon': (
                         args.iou_s_original_log_epsilon
                     ),
@@ -1003,6 +1052,12 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                         args.iou_s_original_chamfer_chunk_size
                     ),
                     return_policy=args.iou_s_original_return_policy,
+                    geometry_weight=args.iou_s_geo_weight,
+                    geometry_reference=geometry_loss_reference,
+                    feature_names=feature_names,
+                    geometry_reference_class_id=(
+                        geometry_reference_class_id
+                    ),
                 )
             else:
                 point_mask = None
@@ -1250,6 +1305,12 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             batch_dict['points'] = attack_output.adv_points
             batch_dict.update(attack_output.model_inputs)
             metrics.update_perturbation(attack_output.stats)
+            if attack_output.step_metrics:
+                frame_id = str(batch_dict['frame_id'][0])
+                iou_s_loss_trace.extend({
+                    'frame_id': frame_id,
+                    **row,
+                } for row in attack_output.step_metrics)
             naturalness.update(
                 original_points,
                 attack_output.adv_points,
@@ -1324,6 +1385,16 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
         naturalness.write_csv(naturalness_path)
         results['measurement_naturalness'] = naturalness.compute()
         results['measurement_naturalness_file'] = str(naturalness_path)
+    if iou_s_loss_trace:
+        trace_path = output_dir / 'iou_s_original_loss_trace.csv'
+        with trace_path.open('w', newline='', encoding='utf-8') as stream:
+            trace_writer = csv.DictWriter(
+                stream, fieldnames=list(iou_s_loss_trace[0])
+            )
+            trace_writer.writeheader()
+            trace_writer.writerows(iou_s_loss_trace)
+        results['iou_s_original_loss_trace_file'] = str(trace_path)
+        results['iou_s_original_loss_trace_rows'] = len(iou_s_loss_trace)
     for class_name in target_class_names:
         results['object_outcomes']['by_class'].setdefault(
             class_name,
@@ -1412,6 +1483,10 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
             'Original IoU-S init / distance weight: %g / %g',
             args.iou_s_original_init_noise,
             args.iou_s_original_distance_weight,
+        )
+        logger.info(
+            'Original IoU-S Stage-2-Q95 geometry weight: %g',
+            args.iou_s_geo_weight,
         )
         logger.info('Original IoU-S Point Scope: full scene')
         logger.info('Original IoU-S Hard Epsilon Projection: disabled')
@@ -1537,6 +1612,25 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 diagnostics.get('iou_s_original_best_distance_loss', 0.0),
                 diagnostics.get('iou_s_original_best_total_loss', 0.0),
             )
+            logger.info(
+                'Original IoU-S mean geometry reference points / selected raw / '
+                'weighted loss: %.1f / %.6f / %.6f',
+                diagnostics.get(
+                    'iou_s_original_geometry_reference_points', 0.0
+                ),
+                diagnostics.get(
+                    'iou_s_original_selected_geometry_loss', 0.0
+                ),
+                diagnostics.get(
+                    'iou_s_original_selected_weighted_geometry_loss', 0.0
+                ),
+            )
+            if 'iou_s_original_loss_trace_file' in results:
+                logger.info(
+                    'Original IoU-S per-step loss trace: %s (%d rows)',
+                    results['iou_s_original_loss_trace_file'],
+                    results['iou_s_original_loss_trace_rows'],
+                )
             logger.info(
                 'Original IoU-S mean best step / early <=10 / early <=100: '
                 '%.1f / %.3f / %.3f',

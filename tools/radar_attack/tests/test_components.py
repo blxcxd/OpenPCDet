@@ -20,6 +20,7 @@ from tools.radar_attack.attacks import (
     build_iadv_attack_mask,
     build_iadv_groups,
     build_iadv_object_ids,
+    build_iou_s_geometry_reference_mask,
     build_measurement_attack_mask,
     build_feature_mask,
     cartesian_to_radar_measurement,
@@ -29,6 +30,7 @@ from tools.radar_attack.attacks import (
     original_iou_s_detection_loss,
     original_iou_s_point_attack,
     prediction_set_retention,
+    radar_geometry_q95_hinge_loss,
     point_cloud_attack,
     points_in_oriented_boxes,
     project_radar_measurements,
@@ -406,6 +408,56 @@ class RadarAttackComponentTest(unittest.TestCase):
         self.assertIsNotNone(predictions['pred_boxes'].grad)
         self.assertIsNotNone(predictions['pred_scores'].grad)
 
+    def test_iou_s_geometry_reference_is_car_current_and_in_range(self):
+        reference = MeasurementQ95Reference.load(
+            Path(__file__).resolve().parents[1]
+            / 'references/vod_stage2_gate1_point_range_q95.json'
+        )
+        points = torch.tensor([
+            [0.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0],
+            [0.0, 15.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 60.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ])
+        boxes = torch.tensor([
+            [5.0, 0.0, 0.0, 4.0, 4.0, 4.0, 0.0, 1.0],
+            [15.0, 0.0, 0.0, 4.0, 4.0, 4.0, 0.0, 2.0],
+            [60.0, 0.0, 0.0, 4.0, 4.0, 4.0, 0.0, 1.0],
+        ])
+
+        mask, q95 = build_iou_s_geometry_reference_mask(
+            points=points,
+            gt_boxes=boxes,
+            feature_names=['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'],
+            q95_reference=reference,
+            reference_class_id=1,
+        )
+
+        self.assertEqual(mask.tolist(), [True, False, False, False, False])
+        self.assertTrue((q95[mask] > 0).all())
+
+    def test_iou_s_geometry_loss_uses_reference_count_denominator(self):
+        clean = torch.tensor([
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ])
+        adversarial = clean.clone()
+        adversarial[0, 0] = 12.0
+        adversarial[1, 0] = 100.0
+        adversarial.requires_grad_(True)
+        mask = torch.tensor([True, False])
+        q95 = torch.ones_like(clean)
+
+        loss = radar_geometry_q95_hinge_loss(
+            clean, adversarial, mask, q95
+        )
+        loss.backward()
+
+        self.assertAlmostEqual(loss.item(), 1.0, places=5)
+        self.assertNotEqual(adversarial.grad[0, 0].item(), 0.0)
+        self.assertEqual(adversarial.grad[1].abs().sum().item(), 0.0)
+
     def test_symmetric_chamfer_matches_two_directed_terms(self):
         first = torch.tensor([[0.0, 0.0, 0.0]])
         second = torch.tensor([[1.0, 2.0, 2.0]])
@@ -492,11 +544,37 @@ class RadarAttackComponentTest(unittest.TestCase):
             steps=2,
             learning_rate=0.01,
             initial_noise=0.001,
+            distance_weight=0.0,
             chamfer_chunk_size=1,
             return_policy='last',
+            geometry_weight=0.1,
+            geometry_reference=MeasurementQ95Reference.load(
+                Path(__file__).resolve().parents[1]
+                / 'references/vod_stage2_gate1_point_range_q95.json'
+            ),
+            feature_names=[
+                'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+            ],
+            geometry_reference_class_id=1,
         )
         self.assertEqual(last_output.stats['iou_s_original_return_last'], 1.0)
         self.assertTrue(torch.equal(last_output.adv_points[:, 4:], points[:, 4:]))
+        self.assertEqual(
+            last_output.stats['iou_s_original_geometry_reference_points'],
+            1.0,
+        )
+        self.assertEqual(len(last_output.step_metrics), 2)
+        self.assertIn('weighted_geometry_loss', last_output.step_metrics[0])
+        self.assertEqual(
+            last_output.stats[
+                'iou_s_original_distance_regularizer_enabled'
+            ],
+            0.0,
+        )
+        self.assertTrue(all(
+            row['distance_loss'] == 0.0
+            for row in last_output.step_metrics
+        ))
 
     def test_measurement_naturalness_uses_gate1_q95_and_wrapped_angles(self):
         reference = MeasurementQ95Reference.load(

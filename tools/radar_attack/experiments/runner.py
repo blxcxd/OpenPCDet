@@ -59,6 +59,8 @@ VALUE_OPTIONS = (
     'iou_s_original_lr',
     'iou_s_original_init_noise',
     'iou_s_original_distance_weight',
+    'iou_s_geo_weight',
+    'iou_s_geo_reference',
     'iou_s_original_log_epsilon',
     'iou_s_original_chamfer_chunk_size',
     'iou_s_original_return_policy',
@@ -139,6 +141,8 @@ SUMMARY_COLUMNS = (
     'iou_s_original_lr',
     'iou_s_original_init_noise',
     'iou_s_original_distance_weight',
+    'iou_s_geo_weight',
+    'iou_s_geo_reference',
     'iou_s_original_return_policy',
     'seed',
     'total_samples',
@@ -216,6 +220,12 @@ SUMMARY_COLUMNS = (
     'iou_s_original_prediction_count_change_fraction',
     'iou_s_original_zero_prediction_step_fraction',
     'iou_s_original_nonfinite_gradient_steps',
+    'iou_s_geo_mean_reference_points',
+    'iou_s_geo_first_base_total_loss',
+    'iou_s_geo_first_loss',
+    'iou_s_geo_first_weighted_loss',
+    'iou_s_geo_selected_loss',
+    'iou_s_geo_selected_weighted_loss',
     'iadv_valid_targets',
     'iadv_mean_points_per_target',
     'iadv_pca_fallback_rate',
@@ -579,6 +589,8 @@ def result_to_row(
         'iou_s_original_distance_weight': attack.get(
             'iou_s_original_distance_weight'
         ),
+        'iou_s_geo_weight': attack.get('iou_s_geo_weight'),
+        'iou_s_geo_reference': attack.get('iou_s_geo_reference'),
         'iou_s_original_return_policy': attack.get(
             'iou_s_original_return_policy'
         ),
@@ -766,6 +778,24 @@ def result_to_row(
         ),
         'iou_s_original_nonfinite_gradient_steps': diagnostics.get(
             'iou_s_original_nonfinite_gradient_steps'
+        ),
+        'iou_s_geo_mean_reference_points': diagnostics.get(
+            'iou_s_original_geometry_reference_points'
+        ),
+        'iou_s_geo_first_base_total_loss': diagnostics.get(
+            'iou_s_original_first_base_total_loss'
+        ),
+        'iou_s_geo_first_loss': diagnostics.get(
+            'iou_s_original_first_geometry_loss'
+        ),
+        'iou_s_geo_first_weighted_loss': diagnostics.get(
+            'iou_s_original_first_weighted_geometry_loss'
+        ),
+        'iou_s_geo_selected_loss': diagnostics.get(
+            'iou_s_original_selected_geometry_loss'
+        ),
+        'iou_s_geo_selected_weighted_loss': diagnostics.get(
+            'iou_s_original_selected_weighted_geometry_loss'
         ),
         'iadv_valid_targets': diagnostics.get('iadv_valid_targets'),
         'iadv_mean_points_per_target': diagnostics.get(
