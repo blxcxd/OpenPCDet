@@ -393,7 +393,8 @@ clean 联合 P95/P99 的比例，不应和边际 `A>1` 比例混淆。
 
 `attack_migration` 还按 clean 点的归属冻结三组：`target_current`、
 `target_history` 和 `non_target_background`。每组累计修改点数以及 XYZ L2 位移的
-mean、P95、max 和 sum；即使攻击后点移出 GT 框，也不会改变所属分组。
+mean、P95、max 和 sum，并报告 `||delta||_2` 严格超过 1 cm、5 cm、10 cm 的
+点数及占该组全部 clean 点的比例；即使攻击后点移出 GT 框，也不会改变所属分组。
 
 #### Radar Object IoU-S loss（适配实验线，非原论文复现）
 

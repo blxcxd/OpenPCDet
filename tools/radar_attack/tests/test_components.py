@@ -704,7 +704,7 @@ class RadarAttackComponentTest(unittest.TestCase):
             [0.0, 4.0, 0.0, 0.0],
         ])
         adversarial = clean.clone()
-        adversarial[0, 1] += 0.1
+        adversarial[0, 1] += 0.08
         adversarial[1, 2] += 0.2
         adversarial[2, 3] += 0.3
         accumulator = AttackMigrationAccumulator()
@@ -718,11 +718,19 @@ class RadarAttackComponentTest(unittest.TestCase):
         groups = accumulator.compute()['groups']
 
         self.assertEqual(groups['target_current']['N_modified'], 1)
-        self.assertAlmostEqual(groups['target_current']['sum_l2_m'], 0.1)
+        self.assertAlmostEqual(groups['target_current']['sum_l2_m'], 0.08)
+        self.assertEqual(groups['target_current']['N_gt_1cm'], 1)
+        self.assertEqual(groups['target_current']['N_gt_5cm'], 1)
+        self.assertEqual(groups['target_current']['N_gt_10cm'], 0)
+        self.assertEqual(groups['target_current']['fraction_gt_5cm'], 1.0)
         self.assertEqual(groups['target_history']['N_modified'], 1)
         self.assertAlmostEqual(groups['target_history']['sum_l2_m'], 0.2)
         self.assertEqual(groups['non_target_background']['total_points'], 2)
         self.assertEqual(groups['non_target_background']['N_modified'], 1)
+        self.assertEqual(groups['non_target_background']['N_gt_10cm'], 1)
+        self.assertEqual(
+            groups['non_target_background']['fraction_gt_10cm'], 0.5
+        )
         self.assertAlmostEqual(
             groups['non_target_background']['sum_l2_m'], 0.3
         )

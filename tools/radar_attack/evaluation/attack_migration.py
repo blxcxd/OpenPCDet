@@ -14,6 +14,11 @@ MIGRATION_GROUPS = (
     'target_history',
     'non_target_background',
 )
+REPORTING_THRESHOLDS_M = {
+    '1cm': 0.01,
+    '5cm': 0.05,
+    '10cm': 0.10,
+}
 
 
 @dataclass
@@ -76,6 +81,10 @@ class AttackMigrationAccumulator:
             )
             count = int(values.size)
             total = self.total_points[name]
+            threshold_counts = {
+                label: int(np.sum(values > threshold))
+                for label, threshold in REPORTING_THRESHOLDS_M.items()
+            }
             groups[name] = {
                 'total_points': total,
                 'N_modified': count,
@@ -84,6 +93,16 @@ class AttackMigrationAccumulator:
                 'p95_l2_m': float(np.quantile(values, 0.95)) if count else None,
                 'max_l2_m': float(values.max()) if count else None,
                 'sum_l2_m': float(values.sum()) if count else 0.0,
+                **{
+                    f'N_gt_{label}': threshold_count
+                    for label, threshold_count in threshold_counts.items()
+                },
+                **{
+                    f'fraction_gt_{label}': (
+                        threshold_count / total if total else None
+                    )
+                    for label, threshold_count in threshold_counts.items()
+                },
             }
         return {
             'membership': 'frozen from clean points',

@@ -1814,6 +1814,14 @@ def evaluate_attack(model, dataloader, args, logger, output_dir):
                 group['max_l2_m'] or 0.0,
                 group['sum_l2_m'],
             )
+            logger.info(
+                'Attack migration %s: N/fraction above 1/5/10 cm = '
+                '%d/%.4f, %d/%.4f, %d/%.4f',
+                group_name,
+                group['N_gt_1cm'], group['fraction_gt_1cm'] or 0.0,
+                group['N_gt_5cm'], group['fraction_gt_5cm'] or 0.0,
+                group['N_gt_10cm'], group['fraction_gt_10cm'] or 0.0,
+            )
     logger.info(f'Recall Drop: {results["recall_drop"]:.4f}')
     if 'vod_official' in results:
         vod_results = results['vod_official']
@@ -2007,6 +2015,13 @@ def main():
                     f'{group["N_modified"]} / {group["mean_l2_m"]} / '
                     f'{group["p95_l2_m"]} / {group["max_l2_m"]} / '
                     f'{group["sum_l2_m"]}\n'
+                )
+                f.write(
+                    f'Attack Migration {group_name} '
+                    '(N/fraction >1cm, >5cm, >10cm): '
+                    f'{group["N_gt_1cm"]}/{group["fraction_gt_1cm"]} / '
+                    f'{group["N_gt_5cm"]}/{group["fraction_gt_5cm"]} / '
+                    f'{group["N_gt_10cm"]}/{group["fraction_gt_10cm"]}\n'
                 )
             f.write(
                 'Measurement Naturalness CSV: '
